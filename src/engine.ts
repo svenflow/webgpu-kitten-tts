@@ -32,9 +32,9 @@ export class KittenTTSEngine {
   /** Uniform buffers created during dispatch, cleaned up after submit. */
   private pendingUniformBuffers: GPUBuffer[] = [];
 
-  /** Shared command encoder for batching dispatches. */
-  private batchEncoder: GPUCommandEncoder | null = null;
-  /** Buffers to destroy after batch encoder is flushed. */
+  /** Pending command buffers for batch submission. */
+  private pendingCommandBuffers: GPUCommandBuffer[] = [];
+  /** Buffers to destroy after batch is flushed. */
   private pendingDestroys: GPUBuffer[] = [];
 
   /** Cached CPU copies of sin generator weights (avoid readBuffer every inference). */
@@ -1290,9 +1290,9 @@ export class KittenTTSEngine {
   }
 
   /**
-   * Execute a dispatch on a pipeline. Dispatches are batched into a shared
-   * command encoder with separate compute passes (for memory barriers).
-   * The encoder is flushed at readBuffer boundaries.
+   * Execute a dispatch on a pipeline. Each dispatch gets its own encoder
+   * (one compute pass each — avoids iOS Safari issues with many-pass encoders).
+   * Command buffers are collected and submitted in batches at flush points.
    */
   private dispatchSingle(
     pipelineName: string,
@@ -1303,28 +1303,27 @@ export class KittenTTSEngine {
   ): void {
     const { pipeline } = this.pipelines.get(pipelineName)!;
 
-    if (!this.batchEncoder) {
-      this.batchEncoder = this.device.createCommandEncoder({ label: 'batch_encoder' });
-    }
-    const pass = this.batchEncoder.beginComputePass({ label: pipelineName });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
     pass.end();
+    this.pendingCommandBuffers.push(encoder.finish());
   }
 
-  /** Queue a buffer for destruction after the batch encoder is flushed. */
+  /** Queue a buffer for destruction after the batch is flushed. */
   private deferDestroy(buffer: GPUBuffer | undefined): void {
     if (buffer) this.pendingDestroys.push(buffer);
   }
 
-  /** Flush the shared batch encoder, submit all pending work, and destroy deferred buffers.
-   *  Once submit() is called, the GPU has captured all buffer references — it's safe to
-   *  destroy immediately. This keeps peak GPU memory low (critical for iOS). */
+  /** Submit all pending command buffers in one call and destroy deferred buffers.
+   *  Batched submission reduces overhead vs per-dispatch submit while keeping
+   *  individual encoders (one pass each) for iOS Safari compatibility. */
   private flushBatchEncoder(): void {
-    if (this.batchEncoder) {
-      this.device.queue.submit([this.batchEncoder.finish()]);
-      this.batchEncoder = null;
+    if (this.pendingCommandBuffers.length > 0) {
+      this.device.queue.submit(this.pendingCommandBuffers);
+      this.pendingCommandBuffers = [];
     }
     this.flushUniformBuffers();
     // Destroy deferred buffers immediately after submit — GPU has captured references
