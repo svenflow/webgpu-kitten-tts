@@ -40,6 +40,14 @@ export class KittenTTSEngine {
   /** Pending command buffers for batch submission. */
   private pendingCommandBuffers: GPUCommandBuffer[] = [];
 
+  /** Shared command encoder for batching dispatches (reduces iOS Safari crashes).
+   *  Dispatches are recorded into this encoder and only submitted at readBuffer
+   *  boundaries or when flushSharedEncoder() is called explicitly. */
+  private sharedEncoder: GPUCommandEncoder | null = null;
+  private sharedPass: GPUComputePass | null = null;
+  /** Buffers to destroy after the shared encoder is submitted. */
+  private deferredDestroys: GPUBuffer[] = [];
+
   /** Cached CPU copies of sin generator weights (avoid readBuffer every inference). */
   private sinGenWeights: {
     linearWeight: Float32Array;   // [9] — harmonic collapse linear layer
@@ -695,7 +703,7 @@ export class KittenTTSEngine {
     // base text encoder LSTM output with the alignment matrix to produce expanded features.
     const expandedTextFeatures = this.createEmptyBuffer(512 * totalFrames, 'expanded_text_features');
     this.dispatchExpandChannelFirst(textEncoderOutput, cumsumBuf, expandedTextFeatures, seqLen, 512, totalFrames);
-    textEncoderOutput.destroy(); // No longer needed after expansion
+    this.deferDestroy(textEncoderOutput); // No longer needed after expansion
     predIntermediates.push(cumsumBuf);
     console.log(`[KittenTTS] Expanded features: [640, ${totalFrames}] for shared LSTM, [512, ${totalFrames}] for decoder`);
 
@@ -820,14 +828,14 @@ export class KittenTTSEngine {
     this.dispatchConcatChannels(expandedTextFeatures, f0Conv, concat512f0, 512, 1, baseFrames);
     const decoderInput = this.createEmptyBuffer(514 * baseFrames, 'decoder_input');
     this.dispatchConcatChannels(concat512f0, nConv, decoderInput, 513, 1, baseFrames);
-    concat512f0.destroy();
+    this.deferDestroy(concat512f0);
     await this.captureDebug('/decoder/Concat_output_0', decoderInput, [1, 514, baseFrames]);
 
     // Cleanup predictor intermediates (no sync needed — GPU handles ordering)
-    for (const buf of predIntermediates) buf.destroy();
-    for (const buf of f0Intermediates) buf.destroy();
-    nProjOut.destroy();
-    bertOutput.destroy();
+    for (const buf of predIntermediates) this.deferDestroy(buf);
+    for (const buf of f0Intermediates) this.deferDestroy(buf);
+    this.deferDestroy(nProjOut);
+    this.deferDestroy(bertOutput);
 
     // ── Decoder encode block ──
     let decFrames = baseFrames; // Track decoder frame count (doubles at decode.3)
@@ -837,7 +845,7 @@ export class KittenTTSEngine {
     );
     // Debug: decoder encode output (matches ONNX /decoder/encode/Div_output_0)
     await this.captureDebug('/decoder/encode/Div_output_0', encodeOut, [1, 1024, decFrames]);
-    decoderInput.destroy();
+    this.deferDestroy(decoderInput);
 
     // ── Decoder decode blocks ──
     // asr_res: conv1x1(512→64) applied to expanded text features [512, baseFrames]
@@ -845,11 +853,11 @@ export class KittenTTSEngine {
     const asrResBias = this.requireWeight('kmodel.decoder.asr_res.0.bias');
     let asrResOut: GPUBuffer | undefined = this.createEmptyBuffer(64 * baseFrames, 'asr_res');
     this.dispatchConv1d(expandedTextFeatures, asrResWeight.buffer, asrResBias.buffer, asrResOut, 512, 64, 1, baseFrames, baseFrames, 0, 1, 1, true);
-    expandedTextFeatures.destroy();
+    this.deferDestroy(expandedTextFeatures);
 
     // Build 1090-channel input for decode blocks (all on GPU)
     let decodeInput2 = this.buildDecodeInput(encodeOut, f0Conv, nConv, asrResOut, 1024, decFrames);
-    encodeOut.destroy();
+    this.deferDestroy(encodeOut);
 
     let decodeOut: GPUBuffer = decodeInput2; // Will be reassigned in loop
 
@@ -865,14 +873,14 @@ export class KittenTTSEngine {
           prefix, true,
           { weightName: 'kmodel.decoder.decode.3.pool.weight', channels: inCh },
         );
-        decodeInput2.destroy();
+        this.deferDestroy(decodeInput2);
         decFrames = decFrames * 2; // Pool doubles the length
       } else {
         decodeOut = await this.runDecoderBlock(
           decodeInput2, styleDec, inCh, outCh, decFrames,
           prefix, true,
         );
-        decodeInput2.destroy();
+        this.deferDestroy(decodeInput2);
       }
 
       // Debug: decoder block output (matches ONNX /decoder/decode.{i}/Div_output_0)
@@ -881,13 +889,13 @@ export class KittenTTSEngine {
       if (di < 3) {
         // Build next decode input: concat decode output[outCh] + asr_res[64] + F0/N[2]
         decodeInput2 = this.buildDecodeInput(decodeOut, f0Conv, nConv, asrResOut ?? null, outCh, decFrames);
-        decodeOut.destroy();
+        this.deferDestroy(decodeOut);
       }
     }
 
     // Cleanup F0/N conv buffers now that decode loop is done
-    f0Conv.destroy();
-    nConv.destroy();
+    this.deferDestroy(f0Conv);
+    this.deferDestroy(nConv);
 
     // Assign totalFrames to the new doubled value for the generator
     totalFrames = decFrames;
@@ -908,7 +916,7 @@ export class KittenTTSEngine {
     // ── LeakyReLU(0.1) before ups.0 (ONNX: LeakyRelu_0 on decoder output) ──
     const preUps0Leaky = this.createEmptyBuffer(genChannels * genLength, 'pre_ups0_leaky');
     this.dispatchLeakyRelu(genFeatures, preUps0Leaky, genChannels * genLength, 0.1);
-    genFeatures.destroy();
+    this.deferDestroy(genFeatures);
     genFeatures = preUps0Leaky;
 
     // ── ups.0: ConvTranspose1d(512→256, k=20, stride=10, pad=5) ──
@@ -919,7 +927,7 @@ export class KittenTTSEngine {
     const ups0Length = genLength * 10;
     const ups0Out = this.createEmptyBuffer(256 * ups0Length, 'ups0');
     this.dispatchConvTranspose1d(genFeatures, ups0Weight.buffer, ups0Bias.buffer, ups0Out, 512, 256, 20, genLength, ups0Length, 10, 5, true);
-    genFeatures.destroy();
+    this.deferDestroy(genFeatures);
     genFeatures = ups0Out;
     genChannels = 256;
     genLength = ups0Length;
@@ -936,7 +944,7 @@ export class KittenTTSEngine {
     // Weights are cached after first call, so only 1 readBuffer (F0 data) needed.
     const stftLen = genLength * 6 + 1; // = ups1Length + 1 = totalFrames * 60 + 1
     const noiseInput = await this.generateSourceExcitation(f0ProjOut, f0Length, stftLen);
-    f0ProjOut.destroy();
+    this.deferDestroy(f0ProjOut);
 
     this.beginBatch(); // Batch 2: noise_convs + resblocks + ups.1 + conv_post
 
@@ -949,13 +957,13 @@ export class KittenTTSEngine {
 
     // ── noise_res.0: 3-iteration AdaIN ResBlock (same as HiFi-GAN resblocks) ──
     const nr0Out = await this.runHiFiGANResBlock(nc0Out, styleDec, 256, nc0Len, 'kmodel.decoder.generator.noise_res.0');
-    nc0Out.destroy();
+    this.deferDestroy(nc0Out);
 
     // ── Add_3: noise_res.0 output + ups.0 output (noise added BEFORE resblocks) ──
     const noisyUps0 = this.createEmptyBuffer(genChannels * genLength, 'noisy_ups0');
     this.dispatchAdd(genFeatures, nr0Out, noisyUps0, genChannels * genLength);
-    genFeatures.destroy();
-    nr0Out.destroy();
+    this.deferDestroy(genFeatures);
+    this.deferDestroy(nr0Out);
     genFeatures = noisyUps0;
 
     // ── resblocks.0 + resblocks.1: parallel residual blocks, output averaged ──
@@ -965,18 +973,18 @@ export class KittenTTSEngine {
     // Average: (resblock0 + resblock1) / 2
     const resSum0 = this.createEmptyBuffer(genChannels * genLength, 'res_sum0');
     this.dispatchAdd(resblock0, resblock1, resSum0, genChannels * genLength);
-    resblock0.destroy();
-    resblock1.destroy();
+    this.deferDestroy(resblock0);
+    this.deferDestroy(resblock1);
     const resAvg0 = this.createEmptyBuffer(genChannels * genLength, 'res_avg0');
     this.dispatchScale(resSum0, resAvg0, genChannels * genLength, 0.5);
-    resSum0.destroy();
-    genFeatures.destroy();
+    this.deferDestroy(resSum0);
+    this.deferDestroy(genFeatures);
     genFeatures = resAvg0;
 
     // ── LeakyReLU(0.1) before ups.1 (ONNX: LeakyRelu_1 after resblock average) ──
     const preUps1Leaky = this.createEmptyBuffer(genChannels * genLength, 'pre_ups1_leaky');
     this.dispatchLeakyRelu(genFeatures, preUps1Leaky, genChannels * genLength, 0.1);
-    genFeatures.destroy();
+    this.deferDestroy(genFeatures);
     genFeatures = preUps1Leaky;
 
     // ── ups.1: ConvTranspose1d(256→128, k=12, stride=6, pad=3) ──
@@ -987,7 +995,7 @@ export class KittenTTSEngine {
     const ups1Length = genLength * 6;
     const ups1Out = this.createEmptyBuffer(128 * ups1Length, 'ups1');
     this.dispatchConvTranspose1d(genFeatures, ups1Weight.buffer, ups1Bias.buffer, ups1Out, 256, 128, 12, genLength, ups1Length, 6, 3, true);
-    genFeatures.destroy();
+    this.deferDestroy(genFeatures);
     genFeatures = ups1Out;
     genChannels = 128;
     genLength = ups1Length;
@@ -1003,7 +1011,7 @@ export class KittenTTSEngine {
       const paddedLength = genLength + 1;
       const paddedOut = this.createEmptyBuffer(genChannels * paddedLength, 'gen_reflected');
       this.dispatchReflectionPad1d(genFeatures, paddedOut, genChannels, genLength, 1, 0);
-      genFeatures.destroy();
+      this.deferDestroy(genFeatures);
       genFeatures = paddedOut;
       genLength = paddedLength;
     }
@@ -1014,18 +1022,18 @@ export class KittenTTSEngine {
     const nc1Bias = this.requireWeight('kmodel.decoder.generator.noise_convs.1.bias');
     const nc1Out = this.createEmptyBuffer(128 * stftLen, 'noise_convs1');
     this.dispatchConv1d(noiseInput, nc1Weight.buffer, nc1Bias.buffer, nc1Out, 22, 128, 1, stftLen, stftLen, 0, 1, 1, true);
-    noiseInput.destroy(); // Done with noise source
+    this.deferDestroy(noiseInput); // Done with noise source
 
     // ── noise_res.1: 3-iteration AdaIN ResBlock ──
     const nr1Out = await this.runHiFiGANResBlock(nc1Out, styleDec, 128, stftLen, 'kmodel.decoder.generator.noise_res.1');
-    nc1Out.destroy();
+    this.deferDestroy(nc1Out);
 
     // ── Add_5: noise_res.1 output + reflection_pad output (noise added BEFORE resblocks) ──
     // genLength should equal stftLen at this point (both are ups1Length + 1)
     const noisyPad = this.createEmptyBuffer(genChannels * genLength, 'noisy_pad');
     this.dispatchAdd(genFeatures, nr1Out, noisyPad, genChannels * genLength);
-    genFeatures.destroy();
-    nr1Out.destroy();
+    this.deferDestroy(genFeatures);
+    this.deferDestroy(nr1Out);
     genFeatures = noisyPad;
 
     // ── resblocks.2 + resblocks.3: parallel residual blocks, output averaged ──
@@ -1034,24 +1042,24 @@ export class KittenTTSEngine {
 
     const resSum1 = this.createEmptyBuffer(genChannels * genLength, 'res_sum1');
     this.dispatchAdd(resblock2, resblock3, resSum1, genChannels * genLength);
-    resblock2.destroy();
-    resblock3.destroy();
+    this.deferDestroy(resblock2);
+    this.deferDestroy(resblock3);
     const resAvg1 = this.createEmptyBuffer(genChannels * genLength, 'res_avg1');
     this.dispatchScale(resSum1, resAvg1, genChannels * genLength, 0.5);
-    resSum1.destroy();
-    genFeatures.destroy();
+    this.deferDestroy(resSum1);
+    this.deferDestroy(genFeatures);
     genFeatures = resAvg1;
 
     // ── LeakyReLU + conv_post: conv(128→22, k=7) ──
     const postLeaky = this.createEmptyBuffer(genChannels * genLength, 'post_leaky');
     this.dispatchLeakyRelu(genFeatures, postLeaky, genChannels * genLength, 0.01);
-    genFeatures.destroy();
+    this.deferDestroy(genFeatures);
 
     const convPostWeight = this.requireWeight('kmodel.decoder.generator.conv_post.weight_quantized');
     const convPostBias = this.requireWeight('kmodel.decoder.generator.conv_post.bias');
     const convPostOut = this.createEmptyBuffer(22 * genLength, 'conv_post');
     this.dispatchConv1d(postLeaky, convPostWeight.buffer, convPostBias.buffer, convPostOut, 128, 22, 7, genLength, genLength, 3, 1, 1, true);
-    postLeaky.destroy();
+    this.deferDestroy(postLeaky);
 
     this.endBatch(); // Flush batch 2: noise + resblocks + ups.1 + conv_post
 
@@ -1074,11 +1082,11 @@ export class KittenTTSEngine {
     const waveformGpu = this.createEmptyBuffer(waveformLength, 'waveform_gpu');
     this.dispatchISTFT(convPostOut, stftWeightReal.buffer, stftWeightImag.buffer, waveformGpu,
       genLength, waveformLength, stftBins, stftKernel, stftStride);
-    convPostOut.destroy();
+    this.deferDestroy(convPostOut);
 
     // Read back and trim: ONNX Slice_3 does starts=[10], ends=[-10] on axis 2
     const waveformData = await this.readBuffer(waveformGpu, waveformLength);
-    waveformGpu.destroy();
+    this.deferDestroy(waveformGpu);
     const trimStart = 10;
     const trimEnd = waveformLength - 10;
     const finalWaveform = waveformData.slice(trimStart, trimEnd);
@@ -1099,23 +1107,23 @@ export class KittenTTSEngine {
     // Cleanup — destroy ALL intermediate GPU buffers to prevent memory leaks
     // Note: many buffers are already pushed to predIntermediates/f0Intermediates
     // and destroyed earlier (line ~803-804). Only destroy ones NOT in those arrays.
-    inputIdsBuf.destroy();
-    styleBuf.destroy();
-    speedBuf.destroy();
-    tokenTypeIds.destroy();      // leaked: never in predIntermediates
-    tokenTypeEmbOut.destroy();   // leaked: never in predIntermediates
-    wordPlusTokenType.destroy(); // leaked: never in predIntermediates
-    posIds.destroy();
-    posEmbOut.destroy();
-    embeddingOut.destroy();
-    bertEmbedding.destroy();
-    stylePred.destroy();
-    styleDec.destroy();
-    asrResOut?.destroy();
+    this.deferDestroy(inputIdsBuf);
+    this.deferDestroy(styleBuf);
+    this.deferDestroy(speedBuf);
+    this.deferDestroy(tokenTypeIds);      // leaked: never in predIntermediates
+    this.deferDestroy(tokenTypeEmbOut);   // leaked: never in predIntermediates
+    this.deferDestroy(wordPlusTokenType); // leaked: never in predIntermediates
+    this.deferDestroy(posIds);
+    this.deferDestroy(posEmbOut);
+    this.deferDestroy(embeddingOut);
+    this.deferDestroy(bertEmbedding);
+    this.deferDestroy(stylePred);
+    this.deferDestroy(styleDec);
+    if (asrResOut) this.deferDestroy(asrResOut);
     // bertProjOut — already in predIntermediates[0], destroyed at line ~803
-    sharedTransposed.destroy();  // leaked: never in predIntermediates
-    // Final flush of any remaining uniform buffers
-    this.flushUniformBuffers();
+    this.deferDestroy(sharedTransposed);  // leaked: never in predIntermediates
+    // Final flush: destroy deferred buffers + remaining uniform buffers
+    this.flushBatchEncoder();
 
     return { waveform: finalWaveform, duration: durations };
   }
@@ -1290,9 +1298,9 @@ export class KittenTTSEngine {
   }
 
   /**
-   * Execute a dispatch on a pipeline. Each dispatch gets its own encoder
-   * and is submitted immediately (ensures correct memory barriers and
-   * allows buffer destruction right after dispatch).
+   * Execute a dispatch on a pipeline. Dispatches are batched into a shared
+   * command encoder to reduce iOS Safari crashes (177 submits → ~5).
+   * The shared encoder is flushed at readBuffer boundaries.
    */
   private dispatchSingle(
     pipelineName: string,
@@ -1303,18 +1311,44 @@ export class KittenTTSEngine {
   ): void {
     const { pipeline } = this.pipelines.get(pipelineName)!;
 
-    const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-    pass.end();
-    this.device.queue.submit([encoder.finish()]);
+    // Lazily create shared encoder
+    if (!this.sharedEncoder) {
+      this.sharedEncoder = this.device.createCommandEncoder({ label: 'shared_batch' });
+      this.sharedPass = this.sharedEncoder.beginComputePass({ label: 'shared_pass' });
+    }
+
+    this.sharedPass!.setPipeline(pipeline);
+    this.sharedPass!.setBindGroup(0, bindGroup);
+    this.sharedPass!.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
   }
 
-  /** Flush uniform buffers (dispatches are submitted immediately now). */
-  private flushBatchEncoder(): void {
+  /** Queue a buffer for destruction after the next shared encoder flush.
+   *  Use this instead of buffer.destroy() when batching dispatches. */
+  private deferDestroy(buffer: GPUBuffer): void {
+    this.deferredDestroys.push(buffer);
+  }
+
+  /** Flush the shared encoder — submit all batched dispatches and destroy deferred buffers. */
+  private flushSharedEncoder(): void {
+    if (this.sharedPass) {
+      this.sharedPass.end();
+      this.sharedPass = null;
+    }
+    if (this.sharedEncoder) {
+      this.device.queue.submit([this.sharedEncoder.finish()]);
+      this.sharedEncoder = null;
+    }
+    // Now safe to destroy deferred buffers (GPU has captured their contents)
+    for (const buf of this.deferredDestroys) {
+      buf.destroy();
+    }
+    this.deferredDestroys.length = 0;
     this.flushUniformBuffers();
+  }
+
+  /** Flush uniform buffers and shared encoder. */
+  private flushBatchEncoder(): void {
+    this.flushSharedEncoder();
   }
 
   /** Read buffer contents back to CPU. */
