@@ -345,8 +345,10 @@ export class KittenTTSEngine {
       throw new Error(`Voice not found: ${voice} (${voiceKey})`);
     }
 
-    // Pick a random style vector from 400 options (or use first for deterministic)
-    const styleVec = voiceEmbeddings.subarray(0, 256); // First of 400
+    // Pick style vector based on text length (matches official kittentts package)
+    // ref_id = min(len(text), 399) — longer texts get different style conditioning
+    const refId = Math.min(inputIds.length, 399);
+    const styleVec = voiceEmbeddings.subarray(refId * 256, (refId + 1) * 256);
 
     // Upload inputs to GPU
     const inputIdsBuf = this.createBuffer(

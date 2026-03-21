@@ -29,14 +29,17 @@ export function phonemesToInputIds(phonemes: string): number[] {
   const joined = tokens.join(' ');
 
   // Map characters to indices, skip unknown
-  const ids: number[] = [0]; // Start token
+  const ids: number[] = [0]; // Start token ($)
   for (const char of joined) {
     const idx = symbolToIndex.get(char);
     if (idx !== undefined) {
       ids.push(idx);
     }
   }
-  ids.push(0); // End token
+  // End sequence: … ($) — matches official kittentts package
+  // The … (index 10) signals end-of-utterance to the model
+  ids.push(10); // … (ellipsis)
+  ids.push(0);  // $ (stop)
 
   return ids;
 }
@@ -62,7 +65,12 @@ function letterFallback(word: string): string {
  * Falls back to letter-by-letter phonemization for unknown words.
  */
 export function textToPhonemes(text: string): string {
-  const tokens = text.toLowerCase().match(/[\w']+|[^\w\s]/g) || [];
+  // Ensure text ends with punctuation (matches official kittentts package behavior)
+  let normalized = text.trim();
+  if (normalized && !/[.!?,;:]$/.test(normalized)) {
+    normalized += ',';
+  }
+  const tokens = normalized.toLowerCase().match(/[\w']+|[^\w\s]/g) || [];
   return tokens.map(w => {
     // Try exact match first
     if (PHONEME_DICT[w]) return PHONEME_DICT[w];
