@@ -20,8 +20,12 @@ DEFAULT_CONFIG.symbols.forEach((s, i) => symbolToIndex.set(s, i));
  * and wraps with [0] start/end tokens.
  */
 export function phonemesToInputIds(phonemes: string): number[] {
-  // Split into words and punctuation, join with spaces
-  const tokens = phonemes.match(/\w+|[^\w\s]/g) || [];
+  // Split into "words" (including Unicode letters like IPA ə, ɪ, ʊ) and punctuation.
+  // CRITICAL: Must use \p{L} (Unicode letter class) instead of \w, because
+  // JS \w only matches [a-zA-Z0-9_] and misses IPA characters like ə, ɪ, ʊ, ɛ, etc.
+  // Python's \w matches Unicode letters by default, so the reference pipeline
+  // groups "həl" as one token, but JS \w would split it as "h", "ə", "l".
+  const tokens = phonemes.match(/[\p{L}\p{N}_]+|[^\p{L}\p{N}_\s]/gu) || [];
   const joined = tokens.join(' ');
 
   // Map characters to indices, skip unknown
