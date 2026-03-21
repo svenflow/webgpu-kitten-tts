@@ -395,11 +395,8 @@ generateBtn.addEventListener('click', async () => {
       }
       // Auto-open log on desktop only (the CSS transition from closed→open
       // triggers compositor layer allocation that crashes iOS Safari WebContent)
-      const isMobileForLog = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-      if (!isMobileForLog && !logContent.classList.contains('open')) logToggle.click();
+      if (!isMobile && !logContent.classList.contains('open')) logToggle.click();
     }
-
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
     // Store for resize redraw (skip on mobile to save memory)
     if (!isMobile) {
