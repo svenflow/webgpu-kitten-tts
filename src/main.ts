@@ -270,8 +270,9 @@ startBtn.addEventListener('click', () => {
   loadModel();
 });
 
-// Auto-start model loading if ?autostart=1
-if (new URLSearchParams(location.search).get('autostart') === '1') {
+// Auto-start model loading if ?autostart=1 (disabled on mobile — causes iOS Safari crash loop)
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+if (!isMobile && new URLSearchParams(location.search).get('autostart') === '1') {
   startBtn.click();
 }
 
@@ -327,8 +328,8 @@ async function loadModel() {
       generateBtn.textContent = 'Generate Speech';
       textInput.focus();
 
-      // Auto-generate if ?autostart=1 is in URL
-      if (new URLSearchParams(location.search).get('autostart') === '1') {
+      // Auto-generate if ?autostart=1 is in URL (disabled on mobile)
+      if (!isMobile && new URLSearchParams(location.search).get('autostart') === '1') {
         log('Auto-start: triggering generation...');
         setTimeout(() => generateBtn.click(), 500);
       }
