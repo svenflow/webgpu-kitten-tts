@@ -487,26 +487,27 @@
             <label for="text-input">Text</label>
             <span class="char-count" id="char-count">45 chars</span>
           </div>
-          <textarea id="text-input" placeholder="Type something to hear it spoken…">Space is a three-dimensional continuum containing positions and directions.</textarea>
+          <textarea id="text-input" placeholder="Type something to hear it spoken…">The quick brown fox jumps over the lazy dog, while the sun sets behind the mountains.</textarea>
           <div class="shortcut-hint" id="shortcut-hint"></div>
         </div>
 
         <div class="presets" role="group" aria-label="Sample texts">
-          <button class="preset-chip active" data-text="Space is a three-dimensional continuum containing positions and directions.">Space</button>
+          <button class="preset-chip active" data-text="The quick brown fox jumps over the lazy dog, while the sun sets behind the mountains.">Fox</button>
           <button class="preset-chip" data-text="She picked up her coffee and walked toward the window.">Coffee</button>
           <button class="preset-chip" data-text="The sun set slowly over the calm, quiet lake.">Sunset</button>
           <button class="preset-chip" data-text="This high-quality TTS model runs without a GPU.">Meta</button>
+          <button class="preset-chip" data-text="Kitten TTS is an open-source text-to-speech model that runs entirely in your browser using WebGPU. It generates natural-sounding speech in real time, with multiple voice options and adjustable speed. No server required — your audio never leaves your device.">Long</button>
         </div>
 
         <div class="controls-row">
           <div class="control-group">
             <label for="voice-select">Voice</label>
             <select id="voice-select">
+              <option value="Hugo" selected>Hugo (M)</option>
               <option value="Jasper">Jasper (M)</option>
               <option value="Bella">Bella (F)</option>
               <option value="Bruno">Bruno (M)</option>
               <option value="Luna">Luna (F)</option>
-              <option value="Hugo">Hugo (M)</option>
               <option value="Rosie">Rosie (F)</option>
               <option value="Leo">Leo (M)</option>
               <option value="Kiki">Kiki (F)</option>

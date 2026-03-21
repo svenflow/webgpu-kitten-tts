@@ -362,8 +362,9 @@ generateBtn.addEventListener('click', async () => {
     lastBlobUrl = URL.createObjectURL(wavBlob);
     audioEl.src = lastBlobUrl;
 
-    // Show output section with animation, let user click play
+    // Show output section with animation and auto-play
     outputSection.classList.add('visible');
+    audioEl.play().catch(() => {});
 
   } catch (e) {
     log(`Generation failed: ${e}`, 'error');
