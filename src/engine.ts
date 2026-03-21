@@ -930,7 +930,7 @@ export class KittenTTSEngine {
     const noiseInput = await this.generateSourceExcitation(f0ProjOut, f0Length, stftLen);
     this.deferDestroy(f0ProjOut);
 
-    this.beginBatch(); // Batch 2: noise_convs + resblocks + ups.1 + conv_post
+    // Batch 2a: noise_convs.0 + noise_res.0 + resblocks 0+1
 
     // ── noise_convs.0: Conv1d(22→256, k=12, stride=6, pad=3) → [256, ups0Length] ──
     const nc0Weight = this.requireWeight('kmodel.decoder.generator.noise_convs.0.weight_quantized');
@@ -965,6 +965,10 @@ export class KittenTTSEngine {
     this.deferDestroy(genFeatures);
     genFeatures = resAvg0;
 
+    // Flush batch 2a — free deferred buffers before ups.1 (large buffers ahead)
+    this.flushBatchEncoder();
+
+    // Batch 2b: ups.1 + noise + resblocks 2+3 + conv_post
     // ── LeakyReLU(0.1) before ups.1 (ONNX: LeakyRelu_1 after resblock average) ──
     const preUps1Leaky = this.createEmptyBuffer(genChannels * genLength, 'pre_ups1_leaky');
     this.dispatchLeakyRelu(genFeatures, preUps1Leaky, genChannels * genLength, 0.1);
@@ -1020,6 +1024,10 @@ export class KittenTTSEngine {
     this.deferDestroy(nr1Out);
     genFeatures = noisyPad;
 
+    // Flush batch 2b — free large ups.1 intermediates before resblocks 2+3
+    this.flushBatchEncoder();
+
+    // Batch 2c: resblocks 2+3 + conv_post
     // ── resblocks.2 + resblocks.3: parallel residual blocks, output averaged ──
     const resblock2 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.2');
     const resblock3 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.3');
@@ -1045,7 +1053,7 @@ export class KittenTTSEngine {
     this.dispatchConv1d(postLeaky, convPostWeight.buffer, convPostBias.buffer, convPostOut, 128, 22, 7, genLength, genLength, 3, 1, 1, true);
     this.deferDestroy(postLeaky);
 
-    this.endBatch(); // Flush batch 2: noise + resblocks + ups.1 + conv_post
+    this.endBatch(); // Flush batch 2c: resblocks 2+3 + conv_post
 
     // Debug: conv_post output
     await this.captureDebug('/decoder/generator/conv_post/Conv_output_0', convPostOut, [1, 22, genLength]);
