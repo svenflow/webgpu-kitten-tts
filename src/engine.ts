@@ -32,7 +32,12 @@ export class KittenTTSEngine {
   /** Uniform buffers created during dispatch, cleaned up after submit. */
   private pendingUniformBuffers: GPUBuffer[] = [];
 
-  /** Command batching: currently no-op (shared-encoder batching causes issues on Metal). */
+  /** Command encoder batching: accumulate multiple compute passes in one encoder to reduce submit count.
+   *  Each dispatch gets its own compute pass (for correct barriers), but they share one encoder.
+   *  This reduces queue.submit() calls from ~300 to ~10, critical for iOS Metal stability. */
+  private _batchEncoder: GPUCommandEncoder | null = null;
+  private _batchCount = 0;
+  private readonly BATCH_LIMIT = 32; // Flush every N dispatches
 
   /** Cached CPU copies of sin generator weights (avoid readBuffer every inference). */
   private sinGenWeights: {
@@ -799,9 +804,11 @@ export class KittenTTSEngine {
     concat512f0.destroy();
     await this.captureDebug('/decoder/Concat_output_0', decoderInput, [1, 514, baseFrames]);
 
-    // Cleanup predictor intermediates
+    // Cleanup predictor intermediates and sync GPU to reclaim memory before decoder
     for (const buf of predIntermediates) buf.destroy();
     for (const buf of f0Intermediates) buf.destroy();
+    this.flushBatch();
+    await this.device.queue.onSubmittedWorkDone();
     // sharedTransposed already destroyed via predIntermediates (pushed on N predictor iteration 0)
     nProjOut.destroy();
     bertOutput.destroy();
@@ -870,6 +877,9 @@ export class KittenTTSEngine {
     totalFrames = decFrames;
     // decodeOut is the final decoder output [512, totalFrames] (after pool doubling)
     this.endBatch(); // Flush decoder work
+    // GPU sync checkpoint: let Metal reclaim destroyed buffers before HiFi-GAN
+    // Critical for iOS where GPU memory is limited
+    await this.device.queue.onSubmittedWorkDone();
     console.log(`[KittenTTS] Decoder output: [512, ${totalFrames}]`);
 
     await this.endStage('Decoder (5 blocks)');
@@ -937,7 +947,10 @@ export class KittenTTSEngine {
     genFeatures = noisyUps0;
 
     // ── resblocks.0 + resblocks.1: parallel residual blocks, output averaged ──
+    // Run sequentially with sync between them to limit peak GPU memory on iOS
     const resblock0 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.0');
+    this.flushBatch();
+    await this.device.queue.onSubmittedWorkDone();
     const resblock1 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.1');
 
     // Average: (resblock0 + resblock1) / 2
@@ -1006,8 +1019,16 @@ export class KittenTTSEngine {
     nr1Out.destroy();
     genFeatures = noisyPad;
 
+    // GPU sync checkpoint before the large resblocks (128 × ~17881 — biggest memory pressure)
+    this.flushBatch();
+    await this.device.queue.onSubmittedWorkDone();
+
     // ── resblocks.2 + resblocks.3: parallel residual blocks, output averaged ──
+    // Run sequentially with sync between them to limit peak GPU memory on iOS
     const resblock2 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.2');
+    // Sync: let Metal reclaim resblock2's destroyed intermediates before resblock3
+    this.flushBatch();
+    await this.device.queue.onSubmittedWorkDone();
     const resblock3 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.3');
 
     const resSum1 = this.createEmptyBuffer(genChannels * genLength, 'res_sum1');
@@ -1247,13 +1268,24 @@ export class KittenTTSEngine {
     return w;
   }
 
-  /** Start batching (no-op: shared-encoder batching causes flat waveforms on Metal/Dawn). */
+  /** Start batching — enables command encoder accumulation. */
   private beginBatch(): void {
-    this.flushUniformBuffers();
+    // Flush any leftover batch from previous stage
+    this.flushBatch();
   }
 
-  /** End batching (no-op). */
+  /** End batching — flush accumulated commands to GPU. */
   private endBatch(): void {
+    this.flushBatch();
+  }
+
+  /** Flush accumulated command encoder to GPU. */
+  private flushBatch(): void {
+    if (this._batchEncoder) {
+      this.device.queue.submit([this._batchEncoder.finish()]);
+      this._batchEncoder = null;
+      this._batchCount = 0;
+    }
     this.flushUniformBuffers();
   }
 
@@ -1269,18 +1301,29 @@ export class KittenTTSEngine {
     workgroupsZ = 1,
   ): void {
     const { pipeline } = this.pipelines.get(pipelineName)!;
-    const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
+
+    // Accumulate dispatches in a shared command encoder (separate compute passes for correct barriers).
+    // This reduces queue.submit() from ~300 to ~10, critical for iOS Metal stability.
+    if (!this._batchEncoder) {
+      this._batchEncoder = this.device.createCommandEncoder();
+    }
+
+    const pass = this._batchEncoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
     pass.end();
-    this.device.queue.submit([encoder.finish()]);
-    this.flushUniformBuffers();
+
+    this._batchCount++;
+    if (this._batchCount >= this.BATCH_LIMIT) {
+      this.flushBatch();
+    }
   }
 
   /** Read buffer contents back to CPU. */
   private async readBuffer(buffer: GPUBuffer, size: number): Promise<Float32Array> {
+    // Flush any batched commands before reading back
+    this.flushBatch();
     // Ensure all previous GPU work is done before reading
     await this.device.queue.onSubmittedWorkDone();
 
@@ -2269,9 +2312,13 @@ export class KittenTTSEngine {
     prefix: string, // e.g. 'kmodel.decoder.generator.resblocks.0'
   ): Promise<GPUBuffer> {
     let current = input;
-    const intermediates: GPUBuffer[] = [];
 
     for (let i = 0; i < 3; i++) {
+      // Destroy intermediates per-iteration to reduce peak GPU memory.
+      // At 128×17881 (ups.1 resolution), each buffer is ~9MB.
+      // Accumulating all 3 iterations = ~275MB; per-iteration = ~91MB peak. Critical for iOS.
+      const iterBufs: GPUBuffer[] = [];
+
       // ── InstanceNorm → AdaIN1 → Snake(alpha1) ──
       const norm1 = this.createEmptyBuffer(channels * length, `hifi_norm1_${i}`);
       this.dispatchInstanceNorm(current, norm1, channels, length, 1e-5);
@@ -2283,13 +2330,13 @@ export class KittenTTSEngine {
 
       const adain1Out = this.createEmptyBuffer(channels * length, `hifi_adain1_${i}`);
       this.dispatchAdaIN(norm1, adain1Style, adain1Out, channels, length);
-      intermediates.push(norm1, adain1Style);
+      iterBufs.push(norm1, adain1Style);
 
       // Snake activation: x + (1/alpha) * sin²(alpha * x)
       const alpha1Weight = this.requireWeight(`${prefix}.alpha1.${i}`);
       const snake1Out = this.createEmptyBuffer(channels * length, `hifi_snake1_${i}`);
       this.dispatchSnake(adain1Out, alpha1Weight.buffer, snake1Out, channels, length);
-      intermediates.push(adain1Out);
+      iterBufs.push(adain1Out);
 
       // ── conv1 (dilated) ──
       const conv1Weight = this.requireWeight(`${prefix}.convs1.${i}.weight_quantized`);
@@ -2299,7 +2346,7 @@ export class KittenTTSEngine {
       const padding = Math.floor((kernelSize * dilation - dilation) / 2);
       const conv1Out = this.createEmptyBuffer(channels * length, `hifi_conv1_${i}`);
       this.dispatchConv1d(snake1Out, conv1Weight.buffer, conv1Bias.buffer, conv1Out, channels, channels, kernelSize, length, length, padding, 1, dilation, true);
-      intermediates.push(snake1Out);
+      iterBufs.push(snake1Out);
 
       // ── InstanceNorm → AdaIN2 → Snake(alpha2) ──
       const norm2 = this.createEmptyBuffer(channels * length, `hifi_norm2_${i}`);
@@ -2312,13 +2359,13 @@ export class KittenTTSEngine {
 
       const adain2Out = this.createEmptyBuffer(channels * length, `hifi_adain2_${i}`);
       this.dispatchAdaIN(norm2, adain2Style, adain2Out, channels, length);
-      intermediates.push(conv1Out, norm2, adain2Style);
+      iterBufs.push(conv1Out, norm2, adain2Style);
 
       // Snake activation
       const alpha2Weight = this.requireWeight(`${prefix}.alpha2.${i}`);
       const snake2Out = this.createEmptyBuffer(channels * length, `hifi_snake2_${i}`);
       this.dispatchSnake(adain2Out, alpha2Weight.buffer, snake2Out, channels, length);
-      intermediates.push(adain2Out);
+      iterBufs.push(adain2Out);
 
       // ── conv2 ──
       const conv2Weight = this.requireWeight(`${prefix}.convs2.${i}.weight_quantized`);
@@ -2327,17 +2374,19 @@ export class KittenTTSEngine {
       const pad2 = Math.floor((k2 - 1) / 2);
       const conv2Out = this.createEmptyBuffer(channels * length, `hifi_conv2_${i}`);
       this.dispatchConv1d(snake2Out, conv2Weight.buffer, conv2Bias.buffer, conv2Out, channels, channels, k2, length, length, pad2, 1, 1, true);
-      intermediates.push(snake2Out);
+      iterBufs.push(snake2Out);
 
       // ── Simple residual: output = conv2 + input ──
       const resOut = this.createEmptyBuffer(channels * length, `hifi_res_${i}`);
       this.dispatchAdd(conv2Out, current, resOut, channels * length);
-      intermediates.push(conv2Out);
-      if (current !== input) intermediates.push(current);
+      iterBufs.push(conv2Out);
+      if (current !== input) iterBufs.push(current);
       current = resOut;
+
+      // Destroy all iteration intermediates immediately — don't accumulate across iterations
+      for (const buf of iterBufs) buf.destroy();
     }
 
-    for (const buf of intermediates) buf.destroy();
     return current;
   }
 
