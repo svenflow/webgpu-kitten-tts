@@ -995,10 +995,8 @@ export class KittenTTSEngine {
     this.deferDestroy(genFeatures);
     genFeatures = resAvg0;
 
-    // Flush + GPU sync to free resblocks.0+1 intermediates before ups.1 upsample.
-    // GPU sync forces Metal to reclaim memory before the 6x resolution increase.
+    // Flush to free resblocks.0+1 intermediates before ups.1 upsample.
     this.flushBatchEncoder();
-    await this.device.queue.onSubmittedWorkDone();
 
     // ── LeakyReLU(0.1) before ups.1 (ONNX: LeakyRelu_1 after resblock average) ──
     const preUps1Leaky = this.createEmptyBuffer(genChannels * genLength, 'pre_ups1_leaky');
@@ -1058,15 +1056,12 @@ export class KittenTTSEngine {
     this.deferDestroy(nr1Out);
     genFeatures = noisyPad;
 
-    // Flush + GPU sync to free noise_res.1 intermediates AND force Metal to reclaim
-    // memory before the high-resolution resblocks.2+3 (largest GPU memory section).
+    // Flush to free noise_res.1 intermediates before resblocks.2+3 (high-res)
     this.flushBatchEncoder();
-    await this.device.queue.onSubmittedWorkDone();
 
     // ── resblocks.2 + resblocks.3: parallel residual blocks, output averaged ──
     const resblock2 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.2');
-    // GPU sync between resblocks to force Metal memory reclamation at high resolution
-    await this.device.queue.onSubmittedWorkDone();
+    // Per-iteration flushes inside resblock already free memory; no sync needed here
     const resblock3 = await this.runHiFiGANResBlock(genFeatures, styleDec, genChannels, genLength, 'kmodel.decoder.generator.resblocks.3');
 
     const resSum1 = this.createEmptyBuffer(genChannels * genLength, 'res_sum1');
