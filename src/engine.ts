@@ -1254,45 +1254,31 @@ export class KittenTTSEngine {
     return w;
   }
 
-  /** Shared command encoder for batching dispatches. */
-  private batchEncoder: GPUCommandEncoder | null = null;
-  private batchPass: GPUComputePassEncoder | null = null;
-  private batchDispatchCount = 0;
+  /** Pending uniform buffers from dispatches, flushed at batch boundaries. */
 
   /** Start batching — flush pending uniform buffers. */
   private beginBatch(): void {
     this.flushUniformBuffers();
   }
 
-  /** End batching — flush pending uniform buffers and submit. */
+  /** End batching — flush pending uniform buffers. */
   private endBatch(): void {
-    this.submitBatch();
     this.flushUniformBuffers();
   }
 
   /** Flush pending state (alias for sync points). */
   private flushBatch(): void {
-    this.submitBatch();
     this.flushUniformBuffers();
   }
 
-  /** Submit the current batch of dispatches. */
+  /** No-op for compatibility — batching reverted for Safari. */
   private submitBatch(): void {
-    if (this.batchPass) {
-      this.batchPass.end();
-      this.batchPass = null;
-    }
-    if (this.batchEncoder) {
-      this.device.queue.submit([this.batchEncoder.finish()]);
-      this.batchEncoder = null;
-      this.batchDispatchCount = 0;
-    }
+    this.flushUniformBuffers();
   }
 
   /**
    * Execute a single dispatch on a pipeline.
-   * Batches dispatches into a shared command encoder for minimal submit overhead.
-   * Submits every 256 dispatches to avoid excessively large command buffers.
+   * Each dispatch gets its own encoder and submit (Safari compatibility).
    */
   private dispatchSingle(
     pipelineName: string,
@@ -1303,21 +1289,13 @@ export class KittenTTSEngine {
   ): void {
     const { pipeline } = this.pipelines.get(pipelineName)!;
 
-    // Start new batch if needed, or if we've accumulated too many dispatches
-    if (!this.batchEncoder || this.batchDispatchCount >= 256) {
-      this.submitBatch();
-      this.batchEncoder = this.device.createCommandEncoder();
-    }
-
-    // Start new compute pass if needed (each pass can hold many dispatches)
-    if (!this.batchPass) {
-      this.batchPass = this.batchEncoder!.beginComputePass();
-    }
-
-    this.batchPass.setPipeline(pipeline);
-    this.batchPass.setBindGroup(0, bindGroup);
-    this.batchPass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-    this.batchDispatchCount++;
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
 
     this.flushUniformBuffers();
   }
