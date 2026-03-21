@@ -1074,10 +1074,15 @@ export class KittenTTSEngine {
       });
     }
 
-    // Cleanup
+    // Cleanup — destroy ALL intermediate GPU buffers to prevent memory leaks
+    // Note: many buffers are already pushed to predIntermediates/f0Intermediates
+    // and destroyed earlier (line ~803-804). Only destroy ones NOT in those arrays.
     inputIdsBuf.destroy();
     styleBuf.destroy();
     speedBuf.destroy();
+    tokenTypeIds.destroy();      // leaked: never in predIntermediates
+    tokenTypeEmbOut.destroy();   // leaked: never in predIntermediates
+    wordPlusTokenType.destroy(); // leaked: never in predIntermediates
     posIds.destroy();
     posEmbOut.destroy();
     embeddingOut.destroy();
@@ -1085,6 +1090,10 @@ export class KittenTTSEngine {
     stylePred.destroy();
     styleDec.destroy();
     asrResOut?.destroy();
+    // bertProjOut — already in predIntermediates[0], destroyed at line ~803
+    sharedTransposed.destroy();  // leaked: never in predIntermediates
+    // Final flush of any remaining uniform buffers
+    this.flushUniformBuffers();
 
     return { waveform: finalWaveform, duration: durations };
   }
