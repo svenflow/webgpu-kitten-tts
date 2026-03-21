@@ -61,12 +61,30 @@ async function run() {
 
   const t0 = performance.now();
   try {
-    emit('Calling engine.init() — downloads model (~75MB)...');
+    emit('Calling engine.init() — creating WebGPU device...');
     await engine.init();
-    emit(`Engine initialized in ${((performance.now() - t0) / 1000).toFixed(1)}s`, 'ok');
+    emit(`WebGPU device ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`, 'ok');
   } catch (e: any) {
     emit(`FAIL engine.init(): ${e.message}`, 'err');
     setStatus('FAILED — engine init', 'failed');
+    return;
+  }
+
+  // ── 2b. Load model weights + voices ──
+  emit('');
+  emit('=== Loading model weights + voices ===');
+  const HF_BASE = 'https://huggingface.co/KittenML/kitten-tts-mini-0.8/resolve/main';
+  const modelUrl = `${HF_BASE}/kitten_tts_mini_v0_8.onnx`;
+  const voicesUrl = `${HF_BASE}/voices.npz`;
+
+  const t1model = performance.now();
+  try {
+    emit('Downloading model (~75MB) + voices...');
+    await engine.loadModel(modelUrl, voicesUrl);
+    emit(`Model loaded in ${((performance.now() - t1model) / 1000).toFixed(1)}s`, 'ok');
+  } catch (e: any) {
+    emit(`FAIL loadModel(): ${e.message}`, 'err');
+    setStatus('FAILED — model load', 'failed');
     return;
   }
 
