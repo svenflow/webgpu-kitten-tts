@@ -45,36 +45,14 @@ function setStatus(msg: string, cls: string) {
 async function run() {
   setStatus('Starting diagnostics...', 'running');
 
-  // ── 1. WebGPU init ──
+  // ── 1. WebGPU check ──
   emit('Checking WebGPU support...');
   if (!navigator.gpu) {
     emit('FAIL: navigator.gpu not available', 'err');
     setStatus('FAILED — no WebGPU', 'failed');
     return;
   }
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) {
-    emit('FAIL: no GPU adapter', 'err');
-    setStatus('FAILED — no adapter', 'failed');
-    return;
-  }
-  emit(`Adapter: ${(adapter as any).name || 'unknown'}`, 'ok');
-
-  const device = await adapter.requestDevice({
-    requiredLimits: {
-      maxStorageBufferBindingSize: 256 * 1024 * 1024,
-      maxBufferSize: 256 * 1024 * 1024,
-    },
-  });
-  emit(`Device created. Max buffer: ${device.limits.maxBufferSize / 1024 / 1024}MB`, 'ok');
-
-  // Listen for device lost
-  device.lost.then((info) => {
-    emit(`DEVICE LOST: ${info.reason} — ${info.message}`, 'err');
-    setStatus('FAILED — device lost', 'failed');
-  });
-
-  device.destroy();
+  emit('navigator.gpu available', 'ok');
 
   // ── 2. Engine init + model load ──
   emit('');
