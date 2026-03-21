@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kitten TTS — WebGPU Diagnostic</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 16px; margin: 0; font-size: 13px; }
+    h1 { font-size: 18px; color: #d4a853; margin: 0 0 12px; }
+    .log { white-space: pre-wrap; line-height: 1.6; }
+    .ok { color: #4caf50; }
+    .err { color: #f44336; }
+    .warn { color: #ff9800; }
+    .info { color: #90caf9; }
+    #status { font-size: 14px; margin: 8px 0; padding: 8px; border-radius: 4px; }
+    .running { background: #1a3a5c; }
+    .done { background: #1a3c1a; }
+    .failed { background: #3c1a1a; }
+  </style>
+</head>
+<body>
+  <h1>WebGPU Diagnostic</h1>
+  <div id="status" class="running">Starting...</div>
+  <div id="log" class="log"></div>
+
+  <script>
+    // Polyfill for Safari ReadableStream async iterator
+    if (typeof ReadableStream !== 'undefined' && !ReadableStream.prototype[Symbol.asyncIterator]) {
+      ReadableStream.prototype[Symbol.asyncIterator] = async function* () {
+        const reader = this.getReader();
+        try { while (true) { const {value, done} = await reader.read(); if (done) break; yield value; } }
+        finally { reader.releaseLock(); }
+      };
+    }
+
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+    function log(msg, cls) {
+      const d = document.createElement('div');
+      if (cls) d.className = cls;
+      d.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+      logEl.appendChild(d);
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+    function status(msg, cls) { statusEl.textContent = msg; statusEl.className = cls; }
+
+    async function run() {
+      const ua = navigator.userAgent;
+      log('UA: ' + ua.substring(0, 100));
+      log('Safari: ' + (/Safari/.test(ua) && !/Chrome/.test(ua)));
+
+      // 1. WebGPU support
+      log('--- WebGPU Check ---', 'info');
+      if (!navigator.gpu) { log('NO WebGPU', 'err'); status('FAIL: No WebGPU', 'failed'); return; }
+      log('navigator.gpu exists', 'ok');
+
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) { log('No adapter', 'err'); status('FAIL: No adapter', 'failed'); return; }
+      log('Adapter: ' + (adapter.info?.vendor || '?') + ' / ' + (adapter.info?.architecture || '?'), 'ok');
+
+      let device;
+      try {
+        device = await adapter.requestDevice({
+          requiredLimits: { maxBufferSize: 268435456, maxStorageBufferBindingSize: 268435456 }
+        });
+        log('Device created (256MB limits)', 'ok');
+      } catch (e) {
+        log('Device creation failed: ' + e.message, 'err');
+        try {
+          device = await adapter.requestDevice();
+          log('Device created (default limits)', 'warn');
+          log('maxBufferSize: ' + device.limits.maxBufferSize);
+          log('maxStorageBufferBindingSize: ' + device.limits.maxStorageBufferBindingSize);
+        } catch (e2) {
+          log('FATAL: ' + e2.message, 'err'); status('FAIL', 'failed'); return;
+        }
+      }
+
+      device.lost.then(function(info) { log('DEVICE LOST: ' + info.reason + ' ' + info.message, 'err'); });
+
+      // 2. Basic compute
+      log('--- Basic Compute ---', 'info');
+      const code = '@group(0) @binding(0) var<storage, read_write> d: array<f32>;\n@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) { d[id.x] = f32(id.x) * 2.0; }';
+      const mod = device.createShaderModule({ code: code });
+      const pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+      const buf = device.createBuffer({ size: 1024, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const rb = device.createBuffer({ size: 1024, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] });
+
+      var enc = device.createCommandEncoder();
+      var pass = enc.beginComputePass();
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(4);
+      pass.end();
+      enc.copyBufferToBuffer(buf, 0, rb, 0, 1024);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await rb.mapAsync(GPUMapMode.READ);
+      var res = new Float32Array(rb.getMappedRange().slice(0));
+      rb.unmap(); buf.destroy(); rb.destroy();
+      log('result[5]=' + res[5] + ' (expect 10)', res[5] === 10 ? 'ok' : 'err');
+
+      // 3. Many dispatches (individual submit per dispatch — matches our engine)
+      log('--- 200 Individual Dispatches ---', 'info');
+      status('Testing 200 dispatches...', 'running');
+      var t0 = performance.now();
+      for (var i = 0; i < 200; i++) {
+        var tb = device.createBuffer({ size: 1024, usage: GPUBufferUsage.STORAGE });
+        var tbg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: tb } }] });
+        var te = device.createCommandEncoder();
+        var tp = te.beginComputePass();
+        tp.setPipeline(pipe);
+        tp.setBindGroup(0, tbg);
+        tp.dispatchWorkgroups(4);
+        tp.end();
+        device.queue.submit([te.finish()]);
+        tb.destroy();
+        if (i % 50 === 49) {
+          await device.queue.onSubmittedWorkDone();
+          log('  ' + (i+1) + '/200 done (' + ((performance.now()-t0)/1000).toFixed(2) + 's)', 'info');
+        }
+      }
+      await device.queue.onSubmittedWorkDone();
+      log('200 dispatches in ' + ((performance.now()-t0)/1000).toFixed(2) + 's', 'ok');
+
+      // 4. Large buffer test
+      log('--- Large Buffer Test ---', 'info');
+      var sizes = [16, 32, 64, 128];
+      for (var s = 0; s < sizes.length; s++) {
+        try {
+          var lb = device.createBuffer({ size: sizes[s] * 1024 * 1024, usage: GPUBufferUsage.STORAGE });
+          lb.destroy();
+          log(sizes[s] + 'MB buffer: OK', 'ok');
+        } catch (e) {
+          log(sizes[s] + 'MB buffer: FAIL — ' + e.message, 'err');
+        }
+      }
+
+      // 5. Rapid alloc/destroy cycle (simulates HiFi-GAN resblock pattern)
+      log('--- Rapid Alloc/Destroy (HiFi-GAN pattern) ---', 'info');
+      status('Testing rapid alloc/destroy...', 'running');
+      t0 = performance.now();
+      for (var r = 0; r < 3; r++) {
+        var bufs = [];
+        for (var j = 0; j < 20; j++) {
+          // ~9MB per buffer (128 channels * 17881 frames * 4 bytes)
+          var hb = device.createBuffer({ size: 128 * 17881 * 4, usage: GPUBufferUsage.STORAGE });
+          bufs.push(hb);
+        }
+        // Destroy all, then sync
+        for (var k = 0; k < bufs.length; k++) bufs[k].destroy();
+        await device.queue.onSubmittedWorkDone();
+        log('  Round ' + (r+1) + '/3: 20 x 9MB alloc/destroy — OK (' + ((performance.now()-t0)/1000).toFixed(2) + 's)', 'info');
+      }
+      log('HiFi-GAN pattern: OK in ' + ((performance.now()-t0)/1000).toFixed(2) + 's', 'ok');
+
+      // 6. Compute with large workgroups (matmul-like)
+      log('--- Large Workgroup Test ---', 'info');
+      status('Testing large workgroups...', 'running');
+      var matCode = '@group(0) @binding(0) var<storage, read_write> d: array<f32>;\n@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3u) { d[id.x] = f32(id.x); }';
+      var matMod = device.createShaderModule({ code: matCode });
+      var matPipe = device.createComputePipeline({ layout: 'auto', compute: { module: matMod, entryPoint: 'main' } });
+      var matBuf = device.createBuffer({ size: 256 * 256 * 4, usage: GPUBufferUsage.STORAGE });
+      var matBg = device.createBindGroup({ layout: matPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: matBuf } }] });
+      t0 = performance.now();
+      for (var m = 0; m < 50; m++) {
+        var me = device.createCommandEncoder();
+        var mp = me.beginComputePass();
+        mp.setPipeline(matPipe);
+        mp.setBindGroup(0, matBg);
+        mp.dispatchWorkgroups(256);
+        mp.end();
+        device.queue.submit([me.finish()]);
+        if (m % 10 === 9) {
+          await device.queue.onSubmittedWorkDone();
+        }
+      }
+      await device.queue.onSubmittedWorkDone();
+      matBuf.destroy();
+      log('50 large dispatches in ' + ((performance.now()-t0)/1000).toFixed(2) + 's', 'ok');
+
+      // Done
+      log('');
+      log('=== ALL TESTS PASSED ===', 'ok');
+      status('ALL PASSED — WebGPU is working', 'done');
+    }
+
+    run().catch(function(e) {
+      log('UNCAUGHT: ' + e.message, 'err');
+      log(e.stack || '', 'err');
+      status('FAILED: ' + e.message, 'failed');
+    });
+  </script>
+</body>
+</html>
