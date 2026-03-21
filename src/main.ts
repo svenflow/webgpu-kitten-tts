@@ -381,16 +381,18 @@ generateBtn.addEventListener('click', async () => {
         const bar = '█'.repeat(barLen);
         log(`  ${name}: ${ms.toFixed(0)}ms ${bar}`);
       }
-      // Auto-open log to show timings
-      if (!logContent.classList.contains('open')) logToggle.click();
+      // Auto-open log on desktop only (the CSS transition from closed→open
+      // triggers compositor layer allocation that crashes iOS Safari WebContent)
+      const isMobileForLog = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      if (!isMobileForLog && !logContent.classList.contains('open')) logToggle.click();
     }
 
-    // Free GPU intermediate buffers to reduce memory pressure before WAV encoding
-    log('Freeing GPU intermediates...');
-    engine.freeIntermediates?.();
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
-    // Store for resize redraw
-    lastSamples = waveform;
+    // Store for resize redraw (skip on mobile to save memory)
+    if (!isMobile) {
+      lastSamples = waveform;
+    }
 
     // Update metadata
     metaDuration.textContent = `${duration}s`;
@@ -402,14 +404,14 @@ generateBtn.addEventListener('click', async () => {
     timingIndicator.classList.add('visible');
 
     // Skip waveform canvas on mobile to avoid OOM crashes
-    // iPhone WebContent process crashes from GPU buffers + canvas allocation
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
     if (!isMobile) {
       log('Drawing waveform...');
       drawWaveform(waveform);
       log('Waveform drawn');
     } else {
       log('Skipping waveform canvas (mobile)');
+      // Hide the waveform container entirely on mobile
+      waveformCanvas.style.display = 'none';
     }
 
     // Create audio blob
@@ -418,12 +420,24 @@ generateBtn.addEventListener('click', async () => {
     log(`WAV encoded: ${(wavBlob.size / 1024).toFixed(0)}KB`);
     if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
     lastBlobUrl = URL.createObjectURL(wavBlob);
-    audioEl.src = lastBlobUrl;
 
-    // Show output section with animation and auto-play
-    log('Playing audio...');
+    // Show output section BEFORE setting audio src (avoid simultaneous allocs)
     outputSection.classList.add('visible');
-    audioEl.play().catch(() => {});
+
+    // On mobile: don't auto-play (avoids audio buffer allocation on top of
+    // GPU memory), and don't auto-open log (the CSS transition from closed→open
+    // triggers compositor layer allocation that crashes WebContent)
+    if (isMobile) {
+      log('Done! Tap play to listen.');
+      // Defer audio src assignment to let layout settle
+      await new Promise(r => setTimeout(r, 100));
+      audioEl.src = lastBlobUrl;
+    } else {
+      audioEl.src = lastBlobUrl;
+      log('Playing audio...');
+      audioEl.play().catch(() => {});
+    }
+
     log('Done!');
     clearCrashLog();
 

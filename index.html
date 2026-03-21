@@ -426,6 +426,17 @@
       #text-input { min-height: 80px; font-size: 14px; }
       .audio-meta { gap: 10px; font-size: 11px; }
       .shortcut-hint { display: none; }
+
+      /* Kill ALL CSS transitions on mobile to avoid compositor layer
+         allocations that push WebContent over iOS jetsam memory limits
+         when WebGPU buffers are resident. */
+      .output-section,
+      #log-content,
+      #loading-screen,
+      #app,
+      #timing-indicator {
+        transition: none !important;
+      }
     }
   </style>
 </head>
