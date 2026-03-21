@@ -401,9 +401,16 @@ generateBtn.addEventListener('click', async () => {
     timingIndicator.textContent = `${elapsed}s`;
     timingIndicator.classList.add('visible');
 
-    log('Drawing waveform...');
-    drawWaveform(waveform);
-    log('Waveform drawn');
+    // Skip waveform canvas on mobile to avoid OOM crashes
+    // iPhone WebContent process crashes from GPU buffers + canvas allocation
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    if (!isMobile) {
+      log('Drawing waveform...');
+      drawWaveform(waveform);
+      log('Waveform drawn');
+    } else {
+      log('Skipping waveform canvas (mobile)');
+    }
 
     // Create audio blob
     log('Encoding WAV...');
