@@ -1565,12 +1565,12 @@ export class KittenTTSEngine {
       this.debugBertBuffers = { normedEmb, projected: intermediates.find(b => b.label === 'bert_projected') || null, hidden, seqLen, embedDim, hiddenSize, layerBuffers: debugLayerBufs };
     }
 
-    // Flush shared encoder so GPU captures buffer contents, then destroy immediately
-    this.flushSharedEncoder();
+    // Defer destruction — buffers may be referenced by pending shared encoder.
+    // They get cleaned up when endStage() calls flushSharedEncoder().
     const keepLabels = this.debugCapture ? new Set([...debugLayerBufs.keys(), 'bert_projected', 'bert_emb_ln']) : null;
     for (const buf of intermediates) {
       if (keepLabels?.has(buf.label)) continue; // keep for debug
-      buf.destroy();
+      this.deferDestroy(buf);
     }
 
     return hidden; // [seqLen, 768]
@@ -1687,10 +1687,9 @@ export class KittenTTSEngine {
     // Debug: text encoder LSTM output — matches /text_encoder/lstm/LSTM_output_0 [seqLen, 2, 1, 256]
     await this.captureDebug('/text_encoder/lstm/LSTM_output_0', lstmOut, [seqLen, 2, 1, hiddenSize]);
 
-    // Flush shared encoder so GPU captures buffer contents, then destroy immediately
-    this.flushSharedEncoder();
+    // Defer destruction — buffers referenced by pending shared encoder
     for (const buf of intermediates) {
-      buf.destroy();
+      this.deferDestroy(buf);
     }
 
     return lstmOut; // [seqLen, 2, 256] = [seqLen, 512]
@@ -2157,9 +2156,8 @@ export class KittenTTSEngine {
       intermediates.push(residual);
     }
 
-    // Flush shared encoder so GPU captures buffer contents, then destroy immediately
-    this.flushSharedEncoder();
-    for (const buf of intermediates) buf.destroy();
+    // Defer destruction — buffers referenced by pending shared encoder
+    for (const buf of intermediates) this.deferDestroy(buf);
 
     return { output, outChannels, outLength: curLength };
   }
@@ -2286,8 +2284,7 @@ export class KittenTTSEngine {
     this.dispatchScale(rawSum, output, outChannels * curLength, SQRT2_INV);
     intermediates.push(rawSum);
 
-    this.flushSharedEncoder();
-    for (const buf of intermediates) buf.destroy();
+    for (const buf of intermediates) this.deferDestroy(buf);
     return output;
   }
 
@@ -2312,16 +2309,12 @@ export class KittenTTSEngine {
     // Step 2: concat1[featureChannels+64] + f0[1]
     const concat2 = this.createEmptyBuffer((featureChannels + 65) * length, 'dec_concat2');
     this.dispatchConcatChannels(concat1, f0Conv, concat2, featureChannels + 64, 1, length);
-    // concat1 is consumed by the next dispatch before being freed
     // Step 3: concat2[featureChannels+65] + n[1]
     const output = this.createEmptyBuffer((featureChannels + 66) * length, 'dec_concat3');
     this.dispatchConcatChannels(concat2, nConv, output, featureChannels + 65, 1, length);
-
-    // Flush encoder, then destroy intermediates
-    this.flushSharedEncoder();
-    concat1.destroy();
-    concat2.destroy();
-    if (!asrRes) asrBuf.destroy();
+    this.deferDestroy(concat1);
+    this.deferDestroy(concat2);
+    if (!asrRes) this.deferDestroy(asrBuf);
 
     return output;
   }
@@ -2418,9 +2411,8 @@ export class KittenTTSEngine {
       if (current !== input) iterBufs.push(current);
       current = resOut;
 
-      // Flush encoder so GPU captures buffers, then destroy immediately to keep memory low
-      this.flushSharedEncoder();
-      for (const buf of iterBufs) buf.destroy();
+      // Defer destruction — buffers referenced by pending shared encoder
+      for (const buf of iterBufs) this.deferDestroy(buf);
     }
 
     return current;

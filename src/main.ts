@@ -270,10 +270,17 @@ startBtn.addEventListener('click', () => {
   loadModel();
 });
 
-// Auto-start model loading if ?autostart=1
+// Auto-start model loading if ?autostart=1 (with crash loop protection)
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 if (new URLSearchParams(location.search).get('autostart') === '1') {
-  startBtn.click();
+  const crashKey = 'kitten_tts_autostart_crashes';
+  const crashes = parseInt(sessionStorage.getItem(crashKey) || '0');
+  if (crashes < 2) {
+    sessionStorage.setItem(crashKey, String(crashes + 1));
+    startBtn.click();
+  } else {
+    console.warn('[KittenTTS] Autostart disabled — crash loop detected');
+  }
 }
 
 async function loadModel() {
@@ -435,6 +442,7 @@ generateBtn.addEventListener('click', async () => {
 
     log('Done!');
     clearCrashLog();
+    sessionStorage.removeItem('kitten_tts_autostart_crashes');
 
   } catch (e) {
     log(`Generation failed: ${e}`, 'error');
