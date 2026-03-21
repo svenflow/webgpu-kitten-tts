@@ -130,12 +130,22 @@ export async function textToPhonemesEspeak(text: string): Promise<string> {
 }
 
 /**
- * Convert English text to input_ids using espeak-ng WASM (async).
- * This is the primary phonemization path — matches official kittentts exactly.
+ * Convert English text to input_ids.
+ * Primary: espeak-ng WASM (exact match with official kittentts).
+ * Fallback: dictionary phonemizer (for Safari where WASM fails).
  */
-export async function textToInputIds(text: string): Promise<number[]> {
-  const phonemes = await textToPhonemesEspeak(text);
-  return phonemesToInputIds(phonemes);
+export async function textToInputIds(text: string): Promise<{ ids: number[]; method: 'wasm' | 'dictionary' }> {
+  try {
+    const phonemes = await textToPhonemesEspeak(text);
+    if (phonemes) {
+      return { ids: phonemesToInputIds(phonemes), method: 'wasm' };
+    }
+  } catch (e) {
+    console.warn('espeak-ng WASM failed, falling back to dictionary phonemizer:', e);
+  }
+  // Fallback for Safari / environments where WASM doesn't load
+  const phonemes = textToPhonemesDictionary(text);
+  return { ids: phonemesToInputIds(phonemes), method: 'dictionary' };
 }
 
 // ── Dictionary fallback (kept for reference/offline use) ──

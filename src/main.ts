@@ -308,8 +308,8 @@ generateBtn.addEventListener('click', async () => {
   log(`Generating: "${text.slice(0, 80)}${text.length > 80 ? '…' : ''}" (voice=${voice}, speed=${speed}×)`);
 
   try {
-    const inputIds = await textToInputIds(text);
-    log(`Phonemized: ${inputIds.length} tokens`);
+    const { ids: inputIds, method } = await textToInputIds(text);
+    log(`Phonemized: ${inputIds.length} tokens (${method})`);
 
     const start = performance.now();
     const { waveform } = await engine.generate(inputIds, voice, speed, text.length);
