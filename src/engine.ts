@@ -44,7 +44,6 @@ export class KittenTTSEngine {
    *  Dispatches are recorded into this encoder and only submitted at readBuffer
    *  boundaries or when flushSharedEncoder() is called explicitly. */
   private sharedEncoder: GPUCommandEncoder | null = null;
-  private sharedPass: GPUComputePass | null = null;
   /** Buffers to destroy after the shared encoder is submitted. */
   private deferredDestroys: GPUBuffer[] = [];
 
@@ -1314,12 +1313,15 @@ export class KittenTTSEngine {
     // Lazily create shared encoder
     if (!this.sharedEncoder) {
       this.sharedEncoder = this.device.createCommandEncoder({ label: 'shared_batch' });
-      this.sharedPass = this.sharedEncoder.beginComputePass({ label: 'shared_pass' });
     }
 
-    this.sharedPass!.setPipeline(pipeline);
-    this.sharedPass!.setBindGroup(0, bindGroup);
-    this.sharedPass!.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+    // Each dispatch gets its own compute pass for proper memory barriers.
+    // Without separate passes, dispatch B can read stale/zero data from dispatch A's output.
+    const pass = this.sharedEncoder.beginComputePass({ label: pipelineName });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+    pass.end();
   }
 
   /** Queue a buffer for destruction after the next shared encoder flush.
@@ -1330,10 +1332,6 @@ export class KittenTTSEngine {
 
   /** Flush the shared encoder — submit all batched dispatches and destroy deferred buffers. */
   private flushSharedEncoder(): void {
-    if (this.sharedPass) {
-      this.sharedPass.end();
-      this.sharedPass = null;
-    }
     if (this.sharedEncoder) {
       this.device.queue.submit([this.sharedEncoder.finish()]);
       this.sharedEncoder = null;
