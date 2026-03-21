@@ -35,27 +35,98 @@ export function phonemesToInputIds(phonemes: string): number[] {
       ids.push(idx);
     }
   }
-  // End sequence: … ($) — matches official kittentts package
-  ids.push(10); // … (ellipsis)
+  // End token — matches official kittentts package: [0, ...ids..., 0]
   ids.push(0);  // $ (stop)
 
   return ids;
 }
 
+/** Punctuation chars recognized by the kittentts symbol table */
+const PUNCT_RE = /[;:,.!?¡¿—…""«»""]/g;
+
 /**
  * Convert English text to IPA phonemes using espeak-ng WASM.
- * This matches the official kittentts package phonemization exactly.
+ * Preserves punctuation to match official kittentts (which uses
+ * phonemizer.backend.EspeakBackend with preserve_punctuation=True).
+ *
+ * espeak-ng strips punctuation, so we:
+ * 1. Extract punctuation + positions from the original text
+ * 2. Phonemize the stripped text
+ * 3. Re-insert punctuation at their original word boundaries
  */
 export async function textToPhonemesEspeak(text: string): Promise<string> {
-  // Ensure text ends with punctuation (matches official kittentts package)
-  let normalized = text.trim();
-  if (normalized && !/[.!?,;:]$/.test(normalized)) {
-    normalized += ',';
+  const normalized = text.trim();
+  if (!normalized) return '';
+
+  // Split text into alternating (words, punct) segments
+  // e.g. "Hello, world!" → ["Hello", ",", " world", "!"]
+  const segments: { text: string; isPunct: boolean }[] = [];
+  let last = 0;
+  const punctPositions: { char: string; afterWordIdx: number }[] = [];
+
+  // Simple approach: strip punctuation, phonemize, then append punctuation
+  // that appeared at sentence-final position
+  // This matches the Python phonemizer's preserve_punctuation behavior
+  // for the simple case (punctuation at word boundaries)
+
+  // Extract all punctuation with their positions relative to words
+  const words: string[] = [];
+  const puncts: string[] = [];
+  // Split by whitespace, tracking punctuation attached to words
+  const rawTokens = normalized.match(/\S+/g) || [];
+
+  const cleanWords: string[] = [];
+  const trailingPuncts: string[] = [];
+
+  for (const token of rawTokens) {
+    // Strip trailing punctuation from each word
+    let word = token;
+    let trailing = '';
+    while (word.length > 0 && /[;:,.!?¡¿—…""«»""]/.test(word[word.length - 1])) {
+      trailing = word[word.length - 1] + trailing;
+      word = word.slice(0, -1);
+    }
+    // Also strip leading punctuation
+    let leading = '';
+    while (word.length > 0 && /[;:,.!?¡¿—…""«»""]/.test(word[0])) {
+      leading += word[0];
+      word = word.slice(1);
+    }
+    cleanWords.push(word);
+    trailingPuncts.push(leading + trailing);
   }
 
-  // phonemize() returns an array (one entry per input sentence)
-  const result = await phonemize(normalized, 'en-us');
-  return result[0] || '';
+  // Phonemize the cleaned text (without punctuation)
+  const cleanText = cleanWords.filter(w => w.length > 0).join(' ');
+  const result = await phonemize(cleanText, 'en-us');
+  const phonemized = result[0] || '';
+
+  if (!phonemized) return '';
+
+  // Split phonemized output into words to re-insert punctuation
+  const phonemeWords = phonemized.split(/\s+/);
+
+  // Re-insert punctuation after corresponding phoneme words
+  // The phonemizer may merge/split words differently, so we append
+  // all trailing punctuation at the end if word counts don't match
+  const outputParts: string[] = [];
+  let pIdx = 0;
+  for (let i = 0; i < cleanWords.length; i++) {
+    if (cleanWords[i].length > 0 && pIdx < phonemeWords.length) {
+      outputParts.push(phonemeWords[pIdx]);
+      pIdx++;
+    }
+    if (trailingPuncts[i]) {
+      outputParts.push(trailingPuncts[i]);
+    }
+  }
+  // Append any remaining phoneme words
+  while (pIdx < phonemeWords.length) {
+    outputParts.push(phonemeWords[pIdx]);
+    pIdx++;
+  }
+
+  return outputParts.join(' ');
 }
 
 /**
