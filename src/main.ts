@@ -266,6 +266,11 @@ startBtn.addEventListener('click', () => {
   loadModel();
 });
 
+// Auto-start model loading if ?autostart=1
+if (new URLSearchParams(location.search).get('autostart') === '1') {
+  startBtn.click();
+}
+
 async function loadModel() {
   log('Initializing WebGPU...');
   progressText.textContent = 'Initializing WebGPU…';
@@ -317,6 +322,12 @@ async function loadModel() {
       generateBtn.disabled = false;
       generateBtn.textContent = 'Generate Speech';
       textInput.focus();
+
+      // Auto-generate if ?autostart=1 is in URL
+      if (new URLSearchParams(location.search).get('autostart') === '1') {
+        log('Auto-start: triggering generation...');
+        setTimeout(() => generateBtn.click(), 500);
+      }
     }, 400);
 
   } catch (e) {
