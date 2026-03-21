@@ -332,7 +332,8 @@ export class KittenTTSEngine {
   async generate(
     inputIds: number[],
     voice: string = 'Bella',
-    speed: number = 1.0
+    speed: number = 1.0,
+    textLength?: number, // Raw text character count for voice style selection
   ): Promise<{ waveform: Float32Array; duration: Int32Array }> {
     // Resolve voice alias
     const voiceKey = this.config.voiceAliases[voice] || voice;
@@ -341,9 +342,9 @@ export class KittenTTSEngine {
       throw new Error(`Voice not found: ${voice} (${voiceKey})`);
     }
 
-    // Pick style vector based on text length (matches official kittentts package)
+    // Pick style vector based on raw text character length (matches official kittentts package)
     // ref_id = min(len(text), 399) — longer texts get different style conditioning
-    const refId = Math.min(inputIds.length, 399);
+    const refId = Math.min(textLength ?? inputIds.length, 399);
     const styleVec = voiceEmbeddings.subarray(refId * 256, (refId + 1) * 256);
 
     // Upload inputs to GPU
