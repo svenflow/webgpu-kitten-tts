@@ -308,7 +308,7 @@ generateBtn.addEventListener('click', async () => {
   log(`Generating: "${text.slice(0, 80)}${text.length > 80 ? '…' : ''}" (voice=${voice}, speed=${speed}×)`);
 
   try {
-    const inputIds = textToInputIds(text);
+    const inputIds = await textToInputIds(text);
     log(`Phonemized: ${inputIds.length} tokens`);
 
     const start = performance.now();

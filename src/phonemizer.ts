@@ -1,10 +1,11 @@
 /**
  * Browser-side phonemization for Kitten TTS.
  *
- * Uses a pre-computed dictionary of 6000+ words generated from espeak-ng (en-us).
- * Unknown words are phonemized letter-by-letter using a basic English letter-to-phoneme map.
+ * Primary: espeak-ng via WASM (phonemizer.js by xenova) — matches official kittentts package.
+ * Fallback: pre-computed dictionary of 6000+ words (for offline/no-WASM environments).
  */
 
+import { phonemize } from 'phonemizer';
 import { DEFAULT_CONFIG } from './types.js';
 import { PHONEME_DICT } from './phoneme-dict.js';
 
@@ -17,14 +18,12 @@ DEFAULT_CONFIG.symbols.forEach((s, i) => symbolToIndex.set(s, i));
  *
  * The phonemizer splits tokens with regex: /\w+|[^\w\s]/g
  * then joins with spaces, looks up each char in symbol table,
- * and wraps with [0] start/end tokens.
+ * and wraps with start/end tokens.
  */
 export function phonemesToInputIds(phonemes: string): number[] {
   // Split into "words" (including Unicode letters like IPA ə, ɪ, ʊ) and punctuation.
   // CRITICAL: Must use \p{L} (Unicode letter class) instead of \w, because
   // JS \w only matches [a-zA-Z0-9_] and misses IPA characters like ə, ɪ, ʊ, ɛ, etc.
-  // Python's \w matches Unicode letters by default, so the reference pipeline
-  // groups "həl" as one token, but JS \w would split it as "h", "ə", "l".
   const tokens = phonemes.match(/[\p{L}\p{N}_]+|[^\p{L}\p{N}_\s]/gu) || [];
   const joined = tokens.join(' ');
 
@@ -37,7 +36,6 @@ export function phonemesToInputIds(phonemes: string): number[] {
     }
   }
   // End sequence: … ($) — matches official kittentts package
-  // The … (index 10) signals end-of-utterance to the model
   ids.push(10); // … (ellipsis)
   ids.push(0);  // $ (stop)
 
@@ -45,9 +43,32 @@ export function phonemesToInputIds(phonemes: string): number[] {
 }
 
 /**
- * Basic letter-to-phoneme fallback for unknown words.
- * This is a rough approximation — not accurate, but better than passing raw ASCII.
+ * Convert English text to IPA phonemes using espeak-ng WASM.
+ * This matches the official kittentts package phonemization exactly.
  */
+export async function textToPhonemesEspeak(text: string): Promise<string> {
+  // Ensure text ends with punctuation (matches official kittentts package)
+  let normalized = text.trim();
+  if (normalized && !/[.!?,;:]$/.test(normalized)) {
+    normalized += ',';
+  }
+
+  // phonemize() returns an array (one entry per input sentence)
+  const result = await phonemize(normalized, 'en-us');
+  return result[0] || '';
+}
+
+/**
+ * Convert English text to input_ids using espeak-ng WASM (async).
+ * This is the primary phonemization path — matches official kittentts exactly.
+ */
+export async function textToInputIds(text: string): Promise<number[]> {
+  const phonemes = await textToPhonemesEspeak(text);
+  return phonemesToInputIds(phonemes);
+}
+
+// ── Dictionary fallback (kept for reference/offline use) ──
+
 const LETTER_PHONEMES: Record<string, string> = {
   'a': 'æ', 'b': 'b', 'c': 'k', 'd': 'd', 'e': 'ɛ', 'f': 'f',
   'g': 'ɡ', 'h': 'h', 'i': 'ɪ', 'j': 'dʒ', 'k': 'k', 'l': 'l',
@@ -63,43 +84,32 @@ function letterFallback(word: string): string {
 /**
  * Convert English text to IPA phonemes using the pre-computed dictionary.
  * Falls back to letter-by-letter phonemization for unknown words.
+ * @deprecated Use textToPhonemesEspeak() instead for accurate phonemization.
  */
-export function textToPhonemes(text: string): string {
-  // Ensure text ends with punctuation (matches official kittentts package behavior)
+export function textToPhonemesDictionary(text: string): string {
   let normalized = text.trim();
   if (normalized && !/[.!?,;:]$/.test(normalized)) {
     normalized += ',';
   }
   const tokens = normalized.toLowerCase().match(/[\w']+|[^\w\s]/g) || [];
   return tokens.map(w => {
-    // Try exact match first
     if (PHONEME_DICT[w]) return PHONEME_DICT[w];
-    // Try without trailing 's' (basic plural handling)
     if (w.endsWith('s') && PHONEME_DICT[w.slice(0, -1)]) {
       return PHONEME_DICT[w.slice(0, -1)] + 'z';
     }
-    // Try without 'ed' suffix
     if (w.endsWith('ed') && PHONEME_DICT[w.slice(0, -2)]) {
       return PHONEME_DICT[w.slice(0, -2)] + 'd';
     }
-    // Try without 'ing' suffix
     if (w.endsWith('ing') && PHONEME_DICT[w.slice(0, -3)]) {
       return PHONEME_DICT[w.slice(0, -3)] + 'ɪŋ';
     }
     if (w.endsWith('ing') && PHONEME_DICT[w.slice(0, -3) + 'e']) {
       return PHONEME_DICT[w.slice(0, -3) + 'e'].replace(/[ə]$/, '') + 'ɪŋ';
     }
-    // Try without 'ly' suffix
     if (w.endsWith('ly') && PHONEME_DICT[w.slice(0, -2)]) {
       return PHONEME_DICT[w.slice(0, -2)] + 'li';
     }
-    // Punctuation passes through
     if (/^[^\w]+$/.test(w)) return w;
-    // Letter-by-letter fallback
     return letterFallback(w);
   }).join(' ');
-}
-
-export function textToInputIds(text: string): number[] {
-  return phonemesToInputIds(textToPhonemes(text));
 }
