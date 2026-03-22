@@ -171,7 +171,7 @@ npm test          # Phonemizer tests
 
 ## Credits
 
-- [Kitten TTS](https://huggingface.co/KittenML/kitten-tts-mini-0.8) models by KittenML (Apache 2.0)
+- [Kitten TTS](https://github.com/KittenML/KittenTTS) by KittenML — original model and architecture ([models on HuggingFace](https://huggingface.co/KittenML/kitten-tts-mini-0.8), Apache 2.0)
 - [espeak-ng](https://github.com/espeak-ng/espeak-ng) pronunciation dictionary and letter-to-sound rules (GPL-3.0, bundled as data files)
 - [phonemizer](https://www.npmjs.com/package/phonemizer) by Xenova (espeak-ng WASM, used as primary backend on Chrome/Firefox; pure JS fallback on Safari)
 
