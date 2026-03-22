@@ -1,10 +1,10 @@
 /**
- * webgpu-kitten-tts — Run Kitten TTS (80M) in the browser via WebGPU.
+ * kitten-tts-webgpu — Run Kitten TTS (80M) in the browser via WebGPU.
  *
  * One function is all you need:
  *
  * ```typescript
- * import { textToSpeech } from 'webgpu-kitten-tts';
+ * import { textToSpeech } from 'kitten-tts-webgpu';
  *
  * const wav = await textToSpeech('Hello, world!');
  * const audio = new Audio(URL.createObjectURL(wav));
@@ -101,7 +101,7 @@ async function getEngine(onProgress?: (stage: string) => void): Promise<KittenTT
  *
  * @example
  * ```typescript
- * import { textToSpeech } from 'webgpu-kitten-tts';
+ * import { textToSpeech } from 'kitten-tts-webgpu';
  *
  * // Simple usage
  * const wav = await textToSpeech('Hello, world!');

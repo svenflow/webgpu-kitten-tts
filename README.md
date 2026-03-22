@@ -2,7 +2,7 @@
 
 **80M-parameter text-to-speech running entirely in the browser via WebGPU compute shaders. No ONNX Runtime. No C++ inference engines. Just TypeScript and WGSL.**
 
-[**Live Demo**](https://svenflow.github.io/webgpu-kitten-tts/) | [Model Card](https://huggingface.co/KittenML/kitten-tts-mini-0.8)
+[**Live Demo**](https://svenflow.github.io/kitten-tts-webgpu/) | [Model Card](https://huggingface.co/KittenML/kitten-tts-mini-0.8)
 
 ---
 
@@ -19,11 +19,11 @@ A from-scratch neural TTS inference engine where 100% of the model execution hap
 ## Quick Start
 
 ```bash
-npm install webgpu-kitten-tts
+npm install kitten-tts-webgpu
 ```
 
 ```typescript
-import { textToSpeech } from 'webgpu-kitten-tts';
+import { textToSpeech } from 'kitten-tts-webgpu';
 
 const blob = await textToSpeech("The quick brown fox jumps over the lazy dog.");
 
@@ -66,7 +66,7 @@ const blob = await textToSpeech("Generating speech with progress updates.", {
 For repeated generations or fine-grained control, use the engine directly:
 
 ```typescript
-import { KittenTTSEngine, textToInputIds } from 'webgpu-kitten-tts';
+import { KittenTTSEngine, textToInputIds } from 'kitten-tts-webgpu';
 
 const engine = new KittenTTSEngine();
 await engine.init();
@@ -151,8 +151,8 @@ Model loading (first run only): ~2-4s depending on network speed. The 74.6 MB ON
 ## Development
 
 ```bash
-git clone https://github.com/svenflow/webgpu-kitten-tts.git
-cd webgpu-kitten-tts
+git clone https://github.com/svenflow/kitten-tts-webgpu.git
+cd kitten-tts-webgpu
 npm install
 npm run dev
 ```

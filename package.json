@@ -1,5 +1,5 @@
 {
-  "name": "webgpu-kitten-tts",
+  "name": "kitten-tts-webgpu",
   "version": "0.1.0",
   "description": "Run Kitten TTS (80M) locally in the browser via WebGPU. One function call: textToSpeech('Hello!') → WAV blob.",
   "type": "module",
@@ -44,6 +44,6 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/svenflow/webgpu-kitten-tts"
+    "url": "https://github.com/svenflow/kitten-tts-webgpu"
   }
 }
