@@ -26,8 +26,56 @@ interface CompiledPipeline {
 export class KittenTTSEngine {
   private device!: GPUDevice;
   private weights: Map<string, GpuTensor> = new Map();
+  /** Aliases from canonical (mini) onnx:: weight names to actual weight names in the loaded model. */
+  private weightAliases: Map<string, string> = new Map();
   private pipelines: Map<string, CompiledPipeline> = new Map();
   private voices: Map<string, Float32Array> = new Map(); // [400, 256] per voice
+
+  // ── Dynamic model dimensions (detected from weight shapes after loading) ──
+  /** LSTM hidden size for text encoder / predictor / duration / shared LSTMs (mini=256, nano=64). */
+  private lstmHidden = 256;
+  /** Bidirectional LSTM output size = 2 * lstmHidden (mini=512, nano=128). */
+  private lstmBidir = 512;
+  /** Text encoder embedding / CNN channel dim (mini=512, nano varies). Detected from text_encoder embedding weight. */
+  private textEncChannels = 512;
+  /** Style embedding total dimension from voices.npz (typically 256 for all model sizes). */
+  private styleDim = 256;
+  /** Style predictor half-dim = styleDim / 2 (typically 128). */
+  private styleHalf = 128;
+  /** LSTM input size for predictor/duration/shared = lstmBidir + styleHalf. */
+  private lstmInputSize = 640;
+  /** BERT embedding dim (mini=128, nano may differ). */
+  private bertEmbedDim = 128;
+  /** BERT hidden size (mini=768, nano may differ). */
+  private bertHiddenSize = 768;
+  /** BERT number of attention heads (mini=12). */
+  private bertNumHeads = 12;
+  /** BERT head dim = bertHiddenSize / bertNumHeads. */
+  private bertHeadDim = 64;
+  /** BERT FFN intermediate dim (mini=2048). */
+  private bertFfnDim = 2048;
+  /** BERT number of layer iterations (mini=12). */
+  private bertNumLayers = 12;
+  /** Number of predictor LSTM+FC pairs (mini=3, nano=2). */
+  private numPredLstmPairs = 3;
+  /** BERT encoder projection output dim (= lstmBidir, mini=512). */
+  private bertProjDim = 512;
+  /** Number of text encoder CNN blocks (mini=3, nano=2). */
+  private numTextEncCnnBlocks = 3;
+  /** Decoder encode output channels (mini=1024, nano=256). Detected from weight shapes. */
+  private decEncodeOutCh = 1024;
+  /** Decoder decode.0-2 output channels (mini=1024, nano=256). */
+  private decDecodeOutCh = 1024;
+  /** Decoder decode.3 output channels (mini=512, nano=256). */
+  private decDecode3OutCh = 512;
+  /** HiFi-GAN ups.0 output channels (mini=256, nano=128). Detected from weight shapes. */
+  private hifiUps0OutCh = 256;
+  /** HiFi-GAN ups.1 output channels (mini=128, nano=64). */
+  private hifiUps1OutCh = 128;
+  /** N/F0 predictor block0 output channels (mini=512, nano=128). */
+  private predBlock0OutCh = 512;
+  /** N/F0 predictor block1+ output channels (mini=256, nano=64). */
+  private predBlock1OutCh = 256;
   private config: KittenConfig;
   /** Uniform buffers created during dispatch, cleaned up after submit. */
   private pendingUniformBuffers: GPUBuffer[] = [];
@@ -356,6 +404,12 @@ export class KittenTTSEngine {
     // This frees ~75 MB of CPU RAM, critical for iOS Safari jetsam limits.
     this.weightCache.clear();
 
+    // Build ONNX weight aliases (maps canonical mini names → actual names in this model)
+    this.buildOnnxAliases();
+
+    // Detect model dimensions from weight shapes
+    this.detectDimensions();
+
     // Load voices
     const voicesBuffer = await fetch(voicesUrl).then(r => r.arrayBuffer());
     const voiceData = await parseNpz(voicesBuffer);
@@ -363,6 +417,318 @@ export class KittenTTSEngine {
       this.voices.set(name, data);
       console.log(`[KittenTTS] Loaded voice: ${name} (${shape})`);
     }
+
+    // Detect style dimensions from loaded voices (must happen after voice loading)
+    for (const [, data] of this.voices) {
+      this.styleDim = data.length / 400;
+      this.styleHalf = Math.floor(this.styleDim / 2);
+      this.lstmInputSize = this.lstmBidir + this.styleHalf;
+      console.log(`[KittenTTS] Detected styleDim = ${this.styleDim}, styleHalf = ${this.styleHalf}, lstmInputSize = ${this.lstmInputSize}`);
+      break;
+    }
+  }
+
+  /**
+   * Build aliases from canonical (mini) onnx:: weight names to actual names.
+   *
+   * Different model sizes (mini, nano) use different numeric IDs for onnx:: weights.
+   * MatMul weights are always 10 in the same order, so simple positional mapping works.
+   *
+   * LSTM weights vary: mini has 6 LSTMs (18 weights), nano has 5 LSTMs (15 weights).
+   * We map by semantic group rather than simple position:
+   *   Group 0: text encoder LSTM (3 weights)
+   *   Group 1..N: predictor LSTMs (3 weights each, N varies by model)
+   *   Group N+1: duration LSTM (3 weights)
+   *   Group N+2: shared LSTM (3 weights)
+   */
+  private buildOnnxAliases(): void {
+    // Canonical mini MatMul IDs in sorted order (10 total)
+    const canonicalMatMulIds = [5883, 5884, 5887, 5890, 5894, 5895, 5896, 6040, 6245, 6388];
+    // Canonical mini LSTM IDs in sorted order (18 total: 6 LSTMs × 3 weights each)
+    // Groups: [text_enc(3)] [pred0(3)] [pred1(3)] [pred2(3)] [duration(3)] [shared(3)]
+    const canonicalLstmIds = [5873, 5874, 5875, 6093, 6094, 6095, 6143, 6144, 6145, 6193, 6194, 6195, 6242, 6243, 6244, 6291, 6292, 6293];
+
+    // Collect actual onnx:: weight names and extract numeric IDs
+    const matmulEntries: { id: number; baseName: string }[] = [];
+    const lstmEntries: { id: number; baseName: string }[] = [];
+
+    for (const name of this.weights.keys()) {
+      // Strip _quantized suffix to get base name for ID extraction
+      const baseName = name.endsWith('_quantized') ? name.slice(0, -'_quantized'.length) : name;
+
+      const matmulMatch = baseName.match(/^onnx::MatMul_(\d+)$/);
+      if (matmulMatch) {
+        matmulEntries.push({ id: parseInt(matmulMatch[1]), baseName });
+        continue;
+      }
+
+      const lstmMatch = baseName.match(/^onnx::LSTM_(\d+)$/);
+      if (lstmMatch) {
+        lstmEntries.push({ id: parseInt(lstmMatch[1]), baseName });
+        continue;
+      }
+    }
+
+    // Sort by numeric ID
+    matmulEntries.sort((a, b) => a.id - b.id);
+    lstmEntries.sort((a, b) => a.id - b.id);
+
+    // Deduplicate: a weight may appear as both `onnx::MatMul_5883` and `onnx::MatMul_5883_quantized`
+    // Keep unique base names only
+    const uniqueMatmul = [...new Map(matmulEntries.map(e => [e.baseName, e])).values()];
+    const uniqueLstm = [...new Map(lstmEntries.map(e => [e.baseName, e])).values()];
+
+    console.log(`[KittenTTS] Found ${uniqueMatmul.length} MatMul weights, ${uniqueLstm.length} LSTM weights`);
+
+    // Helper: create alias for a canonical base name → actual base name
+    const createAlias = (canonBase: string, actualBase: string) => {
+      if (canonBase === actualBase) return; // Same model, no alias needed
+      for (const suffix of ['', '_quantized']) {
+        const canonName = canonBase + suffix;
+        const actualWithSuffix = actualBase + suffix;
+        if (this.weights.has(actualWithSuffix)) {
+          this.weightAliases.set(canonName, actualWithSuffix);
+        } else if (this.weights.has(actualBase)) {
+          this.weightAliases.set(canonName, actualBase);
+        }
+      }
+      console.log(`[KittenTTS] Alias: ${canonBase} → ${actualBase}`);
+    };
+
+    // MatMul: simple positional mapping (always 10 in both mini and nano)
+    const mmCount = Math.min(canonicalMatMulIds.length, uniqueMatmul.length);
+    for (let i = 0; i < mmCount; i++) {
+      createAlias(`onnx::MatMul_${canonicalMatMulIds[i]}`, uniqueMatmul[i].baseName);
+    }
+
+    // LSTM: semantic group mapping
+    // Each LSTM has 3 sorted weight IDs (B, W, R). Group them.
+    const numActualLstms = uniqueLstm.length / 3;
+    const numCanonLstms = canonicalLstmIds.length / 3; // = 6
+
+    // Determine how many predictor LSTMs exist in actual model
+    // Total LSTMs = 1(text_enc) + N(predictor) + 1(duration) + 1(shared) = N + 3
+    const numActualPredLstms = numActualLstms - 3;
+    const numCanonPredLstms = numCanonLstms - 3; // = 3
+
+    // Build index mapping: canonical LSTM group index → actual LSTM group index
+    // Group 0 → 0 (text encoder)
+    // Group 1..numCanonPredLstms → 1..numActualPredLstms (predictor, mapped positionally within group)
+    // Group numCanonPredLstms+1 → numActualPredLstms+1 (duration)
+    // Group numCanonPredLstms+2 → numActualPredLstms+2 (shared)
+    for (let cg = 0; cg < numCanonLstms; cg++) {
+      let ag: number; // actual group index
+      if (cg === 0) {
+        ag = 0; // text encoder
+      } else if (cg <= numCanonPredLstms) {
+        // Predictor group: map 1-based index if within actual count
+        if (cg <= numActualPredLstms) {
+          ag = cg;
+        } else {
+          continue; // This canonical predictor LSTM doesn't exist in actual model
+        }
+      } else if (cg === numCanonPredLstms + 1) {
+        ag = numActualPredLstms + 1; // duration
+      } else {
+        ag = numActualPredLstms + 2; // shared
+      }
+
+      // Map the 3 weights in this group
+      for (let w = 0; w < 3; w++) {
+        const canonIdx = cg * 3 + w;
+        const actualIdx = ag * 3 + w;
+        if (canonIdx < canonicalLstmIds.length && actualIdx < uniqueLstm.length) {
+          createAlias(`onnx::LSTM_${canonicalLstmIds[canonIdx]}`, uniqueLstm[actualIdx].baseName);
+        }
+      }
+    }
+  }
+
+  /**
+   * Detect model dimensions from loaded weight shapes.
+   * This allows the engine to work with any model size (mini, nano, etc.)
+   * without hardcoding dimensions.
+   */
+  private detectDimensions(): void {
+    // Detect text encoder embedding dim from embedding weight shape [vocab, channels]
+    const teEmb = this.weights.get('kmodel.text_encoder.embedding.weight');
+    if (teEmb) {
+      this.textEncChannels = teEmb.shape[1];
+      console.log(`[KittenTTS] Detected textEncChannels = ${this.textEncChannels}`);
+    }
+
+    // Detect LSTM hidden from text encoder LSTM R weight
+    // R weight shape is [num_directions, hidden_size, 4*hidden_size]
+    // Try canonical name first, then alias
+    const lstmR = this.tryGetWeight('onnx::LSTM_5875_quantized') || this.tryGetWeight('onnx::LSTM_5875');
+    if (lstmR && lstmR.shape.length === 3) {
+      this.lstmHidden = lstmR.shape[1];
+      this.lstmBidir = 2 * this.lstmHidden;
+      console.log(`[KittenTTS] Detected lstmHidden = ${this.lstmHidden}, lstmBidir = ${this.lstmBidir}`);
+    }
+
+    // Detect BERT embedding dim from word embedding weight [vocab, embedDim]
+    const bertEmb = this.weights.get('kmodel.bert.embeddings.word_embeddings.weight');
+    if (bertEmb) {
+      this.bertEmbedDim = bertEmb.shape[1];
+      console.log(`[KittenTTS] Detected bertEmbedDim = ${this.bertEmbedDim}`);
+    }
+
+    // Detect BERT hidden size from embedding_hidden_mapping_in bias [hiddenSize]
+    const bertProjBias = this.weights.get('kmodel.bert.encoder.embedding_hidden_mapping_in.bias');
+    if (bertProjBias) {
+      this.bertHiddenSize = bertProjBias.size;
+      console.log(`[KittenTTS] Detected bertHiddenSize = ${this.bertHiddenSize}`);
+    }
+
+    // Detect BERT num heads from attention query bias / head dim
+    // query bias shape = [hiddenSize], and we know headDim from key weight
+    // Actually detect from attention query weight: shape is [hiddenSize, hiddenSize]
+    // ALBERT shares weights so headDim = hiddenSize / numHeads
+    // Try to detect numHeads from the LayerNorm weight or attention structure
+    // For safety, compute from known ALBERT configs: hiddenSize / headDim
+    // headDim is typically 64 for all ALBERT sizes
+    const attnLnWeight = this.weights.get('kmodel.bert.encoder.albert_layer_groups.0.albert_layers.0.attention.LayerNorm.weight');
+    if (attnLnWeight) {
+      // The hidden size matches
+      this.bertHiddenSize = attnLnWeight.size;
+    }
+    // numHeads = hiddenSize / 64 (ALBERT always uses headDim=64)
+    this.bertHeadDim = 64;
+    this.bertNumHeads = Math.floor(this.bertHiddenSize / this.bertHeadDim);
+    if (this.bertNumHeads < 1) this.bertNumHeads = 1;
+    console.log(`[KittenTTS] Detected bertNumHeads = ${this.bertNumHeads}, bertHeadDim = ${this.bertHeadDim}`);
+
+    // Detect BERT FFN dim from ffn bias
+    const ffnBias = this.weights.get('kmodel.bert.encoder.albert_layer_groups.0.albert_layers.0.ffn.bias');
+    if (ffnBias) {
+      this.bertFfnDim = ffnBias.size;
+      console.log(`[KittenTTS] Detected bertFfnDim = ${this.bertFfnDim}`);
+    }
+
+    // Detect BERT encoder projection output dim from bert_encoder bias
+    const bertEncBias = this.weights.get('kmodel.bert_encoder.bias');
+    if (bertEncBias) {
+      this.bertProjDim = bertEncBias.size;
+      console.log(`[KittenTTS] Detected bertProjDim = ${this.bertProjDim}`);
+    }
+
+    // Detect style dimension from first voice embedding
+    // Voice embeddings are [400, styleDim] — detect from first loaded voice
+    for (const [, data] of this.voices) {
+      this.styleDim = data.length / 400;
+      this.styleHalf = Math.floor(this.styleDim / 2);
+      console.log(`[KittenTTS] Detected styleDim = ${this.styleDim}, styleHalf = ${this.styleHalf}`);
+      break;
+    }
+
+    // Compute derived dimensions
+    this.lstmInputSize = this.lstmBidir + this.styleHalf;
+    console.log(`[KittenTTS] Computed lstmInputSize = ${this.lstmInputSize}`);
+
+    // Detect number of predictor LSTM pairs by checking which weights exist
+    this.numPredLstmPairs = 0;
+    for (let i = 0; i < 10; i++) {
+      const fcName = `kmodel.predictor.text_encoder.lstms.${2 * i + 1}.fc.weight_quantized`;
+      if (this.tryGetWeight(fcName)) {
+        this.numPredLstmPairs = i + 1;
+      } else {
+        break;
+      }
+    }
+    console.log(`[KittenTTS] Detected numPredLstmPairs = ${this.numPredLstmPairs}`);
+
+    // Detect number of text encoder CNN blocks
+    this.numTextEncCnnBlocks = 0;
+    for (let i = 0; i < 10; i++) {
+      if (this.tryGetWeight(`kmodel.text_encoder.cnn.${i}.0.weight_quantized`) ||
+          this.tryGetWeight(`kmodel.text_encoder.cnn.${i}.0.bias`)) {
+        this.numTextEncCnnBlocks = i + 1;
+      } else {
+        break;
+      }
+    }
+    console.log(`[KittenTTS] Detected numTextEncCnnBlocks = ${this.numTextEncCnnBlocks}`);
+
+    // Detect decoder encode output channels from conv2 bias
+    const decEncConv2Bias = this.weights.get('kmodel.decoder.encode.conv2.bias');
+    if (decEncConv2Bias) {
+      this.decEncodeOutCh = decEncConv2Bias.size;
+      console.log(`[KittenTTS] Detected decEncodeOutCh = ${this.decEncodeOutCh}`);
+    }
+
+    // Detect decoder decode output channels from conv2 bias
+    const decDec0Conv2Bias = this.weights.get('kmodel.decoder.decode.0.conv2.bias');
+    if (decDec0Conv2Bias) {
+      this.decDecodeOutCh = decDec0Conv2Bias.size;
+      console.log(`[KittenTTS] Detected decDecodeOutCh = ${this.decDecodeOutCh}`);
+    }
+    const decDec3Conv2Bias = this.weights.get('kmodel.decoder.decode.3.conv2.bias');
+    if (decDec3Conv2Bias) {
+      this.decDecode3OutCh = decDec3Conv2Bias.size;
+      console.log(`[KittenTTS] Detected decDecode3OutCh = ${this.decDecode3OutCh}`);
+    }
+
+    // Detect HiFi-GAN ups output channels from bias
+    const ups0Bias = this.weights.get('kmodel.decoder.generator.ups.0.bias');
+    if (ups0Bias) {
+      this.hifiUps0OutCh = ups0Bias.size;
+      console.log(`[KittenTTS] Detected hifiUps0OutCh = ${this.hifiUps0OutCh}`);
+    }
+    const ups1Bias = this.weights.get('kmodel.decoder.generator.ups.1.bias');
+    if (ups1Bias) {
+      this.hifiUps1OutCh = ups1Bias.size;
+      console.log(`[KittenTTS] Detected hifiUps1OutCh = ${this.hifiUps1OutCh}`);
+    }
+
+    // Detect N/F0 predictor block output channels from conv1 bias
+    const nBlock0Bias = this.weights.get('kmodel.predictor.N.0.conv1.bias');
+    if (nBlock0Bias) {
+      this.predBlock0OutCh = nBlock0Bias.size;
+      console.log(`[KittenTTS] Detected predBlock0OutCh = ${this.predBlock0OutCh}`);
+    }
+    const nBlock1Bias = this.weights.get('kmodel.predictor.N.1.conv1.bias');
+    if (nBlock1Bias) {
+      this.predBlock1OutCh = nBlock1Bias.size;
+      console.log(`[KittenTTS] Detected predBlock1OutCh = ${this.predBlock1OutCh}`);
+    }
+
+    // Detect BERT num layers by checking if albert weights exist
+    // ALBERT uses shared weights so all 12 iterations use the same parameters
+    // The number of iterations may differ: detect from model config if available
+    // For now, default to 12 (ALBERT standard) — nano may override via config
+    // We can detect indirectly: position embedding size tells max seqlen, not num layers
+    // Keep default of 12 — ALBERT always uses 12 shared iterations regardless of model size
+  }
+
+  /** Try to get a weight by name, checking aliases. Returns null if not found. */
+  private tryGetWeight(name: string): GpuTensor | null {
+    // Direct lookup
+    let w = this.weights.get(name);
+    if (w) return w;
+
+    // Check alias
+    const aliasName = this.weightAliases.get(name);
+    if (aliasName) {
+      w = this.weights.get(aliasName);
+      if (w) return w;
+    }
+
+    // Try with/without _quantized suffix
+    if (name.endsWith('_quantized')) {
+      const base = name.slice(0, -'_quantized'.length);
+      w = this.weights.get(base);
+      if (w) return w;
+      const aliasBase = this.weightAliases.get(base);
+      if (aliasBase) return this.weights.get(aliasBase) || null;
+    } else {
+      w = this.weights.get(name + '_quantized');
+      if (w) return w;
+      const aliasQ = this.weightAliases.get(name + '_quantized');
+      if (aliasQ) return this.weights.get(aliasQ) || null;
+    }
+
+    return null;
   }
 
   /** Run TTS inference. */
@@ -387,7 +753,7 @@ export class KittenTTSEngine {
     // Pick style vector based on raw text character length (matches official kittentts package)
     // ref_id = min(len(text), 399) — longer texts get different style conditioning
     const refId = Math.min(textLength ?? inputIds.length, 399);
-    const styleVec = voiceEmbeddings.subarray(refId * 256, (refId + 1) * 256);
+    const styleVec = voiceEmbeddings.subarray(refId * this.styleDim, (refId + 1) * this.styleDim);
 
     // Upload inputs to GPU
     const inputIdsBuf = this.createBuffer(
@@ -415,7 +781,7 @@ export class KittenTTSEngine {
     const posEmbWeight = this.requireWeight('kmodel.bert.embeddings.position_embeddings.weight');
     const tokenTypeEmbWeight = this.requireWeight('kmodel.bert.embeddings.token_type_embeddings.weight');
 
-    const embedDim = 128;
+    const embedDim = this.bertEmbedDim;
     const embeddingOut = this.createEmptyBuffer(seqLen * embedDim, 'bert_embedding');
 
     // Word embedding lookup
@@ -461,7 +827,7 @@ export class KittenTTSEngine {
     // Flush pending embedding dispatches before BERT creates its own encoder
     this.flushBatchEncoder();
     const bertOutput = this.runBertEncoder(inputIdsBuf, bertEmbedding, seqLen);
-    console.log(`[KittenTTS] BERT encoder output: [1, ${seqLen}, 768]`);
+    console.log(`[KittenTTS] BERT encoder output: [1, ${seqLen}, ${this.bertHiddenSize}]`);
     // Debug: capture BERT encoder intermediates with ONNX-matching names
     if (this.debugBertBuffers) {
       const db = this.debugBertBuffers;
@@ -491,7 +857,7 @@ export class KittenTTSEngine {
     this.startStage();
     onProgress?.('3/8 Text encoder'); console.log('[KittenTTS] Running text encoder...');
     const textEncoderOutput = await this.runTextEncoder(inputIdsBuf, seqLen);
-    console.log(`[KittenTTS] Text encoder output: [${seqLen}, 2, 256]`);
+    console.log(`[KittenTTS] Text encoder output: [${seqLen}, 2, ${this.lstmHidden}]`);
 
     await this.endStage('Text encoder (CNN+LSTM)');
 
@@ -499,35 +865,19 @@ export class KittenTTSEngine {
     this.startStage();
     onProgress?.('4/8 Predictor encoder'); console.log('[KittenTTS] Running predictor text encoder...');
 
-    // BERT output → project 768 → 512 for predictor input
-    // ONNX: /bert_encoder/MatMul (768→512) + /bert_encoder/Add (bias)
+    // BERT output → project bertHiddenSize → bertProjDim for predictor input
+    // ONNX: /bert_encoder/MatMul + /bert_encoder/Add (bias)
     const bertProjWeight = this.requireWeight('onnx::MatMul_6040_quantized');
     const bertProjBias = this.requireWeight('kmodel.bert_encoder.bias');
-    const bertProjOut = this.createEmptyBuffer(seqLen * 512, 'bert_proj_512');
-    this.dispatchMatmul(bertOutput, bertProjWeight.buffer, bertProjBias.buffer, bertProjOut, seqLen, 768, 512, true);
-    await this.captureDebug('bert/encoder_proj', bertProjOut, [1, seqLen, 512]);
+    const bertProjOut = this.createEmptyBuffer(seqLen * this.bertProjDim, 'bert_proj');
+    this.dispatchMatmul(bertOutput, bertProjWeight.buffer, bertProjBias.buffer, bertProjOut, seqLen, this.bertHiddenSize, this.bertProjDim, true);
+    await this.captureDebug('bert/encoder_proj', bertProjOut, [1, seqLen, this.bertProjDim]);
 
-    // The predictor text encoder takes text encoder LSTM output [seqLen, 512]
-    // and BERT projected features [seqLen, 512], concatenated → [seqLen, 640]
-    // Actually the LSTM input is 640 = 512 (text) + 128 (style[:128] broadcast or FC output)
-    // For LSTM.0, input = concat(text_encoder_output[512], bert_proj_slice[128])
-    //
-    // TODO: Implement the 6-layer predictor text encoder LSTM stack:
-    //   LSTM.0: W=[2,640,1024] R=[2,256,1024] B=[2,2048] — onnx::LSTM_6094/6095/6093
-    //   FC.1:   weight=[128,1024] bias=[1024] — kmodel.predictor.text_encoder.lstms.1.fc
-    //   LSTM.2: W=[2,640,1024] R=[2,256,1024] B=[2,2048] — onnx::LSTM_6144/6145/6143
-    //   FC.3:   weight=[128,1024] bias=[1024] — kmodel.predictor.text_encoder.lstms.3.fc
-    //   LSTM.4: W=[2,640,1024] R=[2,256,1024] B=[2,2048] — onnx::LSTM_6194/6195/6193
-    //   FC.5:   weight=[128,1024] bias=[1024] — kmodel.predictor.text_encoder.lstms.5.fc
-    //
-    // Each LSTM outputs [seqLen, 2, 256] = [seqLen, 512]
-    // Each FC takes [seqLen, 512] → [seqLen, 1024] (projecting both directions)
-    //   then the 1024 is reshaped/split to [seqLen, 128] (FC output) to concat with text features
-    //
-    // For now, run the predictor LSTM.0 + shared LSTM as a simplified path.
-    // The predictor text encoder LSTMs refine the text features before duration prediction.
+    // The predictor text encoder takes BERT projected features and runs them through
+    // N LSTM+FC pairs (mini=3, nano may be fewer). Each LSTM takes
+    // concat(text_features[lstmBidir], style_pred[styleHalf]) = [seqLen, lstmInputSize]
 
-    // ── Predictor text encoder: 3 LSTM + FC pairs ──
+    // ── Predictor text encoder: N LSTM + FC pairs (dynamically detected) ──
     const predLstmConfigs = [
       { W: 'onnx::LSTM_6094_quantized', R: 'onnx::LSTM_6095_quantized', B: 'onnx::LSTM_6093' },
       { W: 'onnx::LSTM_6144_quantized', R: 'onnx::LSTM_6145_quantized', B: 'onnx::LSTM_6143' },
@@ -540,44 +890,44 @@ export class KittenTTSEngine {
     ];
 
     // ── Style vector split (needed before predictor text encoder) ──
-    // ONNX Slice_1 (node 72): style[:, 128:256] → predictors (N/F0 AdaIN + text encoder FC + LSTM concat)
-    // ONNX Slice (node 73): style[:, 0:128] → decoder (AdaIN conditioning)
-    const stylePredData = styleVec.subarray(128, 256); // [128] raw CPU data
+    // ONNX Slice_1: style[:, styleHalf:styleDim] → predictors (N/F0 AdaIN + text encoder FC + LSTM concat)
+    // ONNX Slice: style[:, 0:styleHalf] → decoder (AdaIN conditioning)
+    const stylePredData = styleVec.subarray(this.styleHalf, this.styleDim); // [styleHalf] raw CPU data
     const stylePred = this.createBuffer(
       stylePredData,
       'style_pred',
       GPUBufferUsage.STORAGE
     );
     const styleDec = this.createBuffer(
-      styleVec.subarray(0, 128),
+      styleVec.subarray(0, this.styleHalf),
       'style_dec',
       GPUBufferUsage.STORAGE
     );
 
-    // Predictor text encoder: 3 LSTM + AdaIN pairs
-    // Each LSTM takes concat(text_features[512], style_pred[128]) = [seqLen, 640]
-    // Each FC layer is an AdaIN generator: style_pred[1,128] → [1,1024] → split to gamma[512]+beta[512]
-    // AdaIN: gamma * LayerNorm(lstm_output) + beta → [seqLen, 512]
+    // Predictor text encoder: N LSTM + AdaIN pairs (N = numPredLstmPairs)
+    // Each LSTM takes concat(text_features[lstmBidir], style_pred[styleHalf]) = [seqLen, lstmInputSize]
+    // Each FC layer is an AdaIN generator: style_pred[1,styleHalf] → [1,2*lstmBidir] → split to gamma+beta
+    // AdaIN: gamma * LayerNorm(lstm_output) + beta → [seqLen, lstmBidir]
     const predIntermediates: GPUBuffer[] = [bertProjOut];
 
-    // Initial text features = BERT encoder projected output [seqLen, 512]
+    // Initial text features = BERT encoder projected output [seqLen, bertProjDim]
     // Confirmed by ONNX graph: lstms.0 X input traces back to bert_encoder linear output,
-    // NOT the text encoder LSTM output. The Concat_1 node concatenates bert_proj[512] + style[:128].
+    // NOT the text encoder LSTM output. The Concat_1 node concatenates bert_proj + style[:styleHalf].
     let predTextFeatures = bertProjOut;
 
-    for (let li = 0; li < 3; li++) {
+    for (let li = 0; li < this.numPredLstmPairs; li++) {
       const cfg = predLstmConfigs[li];
       const fcCfg = predFcConfigs[li];
 
-      const lstmInputSize = 640;
-      const lstmHidden = 256;
+      const lstmInputSize = this.lstmInputSize;
+      const lstmHidden = this.lstmHidden;
       const lstmW = this.requireWeight(cfg.W);
       const lstmR = this.requireWeight(cfg.R);
       const lstmB = this.requireWeight(cfg.B);
 
-      // LSTM input: concat(text_features[seqLen,512], style_pred[128]) on GPU → [seqLen, 640]
+      // LSTM input: concat(text_features[seqLen,lstmBidir], style_pred[styleHalf]) on GPU → [seqLen, lstmInputSize]
       const lstmInput = this.createEmptyBuffer(seqLen * lstmInputSize, `pred_lstm${li}_in`);
-      this.dispatchConcatBroadcast(predTextFeatures, stylePred, lstmInput, seqLen, 512, 128);
+      this.dispatchConcatBroadcast(predTextFeatures, stylePred, lstmInput, seqLen, this.lstmBidir, this.styleHalf);
 
       // GPU LSTM
       const lstmOut = this.createEmptyBuffer(seqLen * 2 * lstmHidden, `pred_lstm${li}_out`);
@@ -588,14 +938,15 @@ export class KittenTTSEngine {
       const predLstmIdx = 2 * li;
       await this.captureDebug(`/text_encoder/lstms.${predLstmIdx}/LSTM_output_0`, lstmOut, [seqLen, 2, 1, lstmHidden]);
 
-      // FC layer: style_pred[1,128] → [1,1024] (AdaIN parameters: gamma[:512]+1, beta[512:])
+      // FC layer: style_pred[1,styleHalf] → [1,fcOutDim] (AdaIN parameters: gamma+beta)
       const fcWeight = this.requireWeight(fcCfg.weight);
       const fcBias = this.requireWeight(fcCfg.bias);
-      const fcOut = this.createEmptyBuffer(1024, `pred_fc${li}_out`);
-      this.dispatchMatmul(stylePred, fcWeight.buffer, fcBias.buffer, fcOut, 1, 128, 1024, true);
+      const fcOutDim = fcBias.size; // = 2 * lstmBidir
+      const fcOut = this.createEmptyBuffer(fcOutDim, `pred_fc${li}_out`);
+      this.dispatchMatmul(stylePred, fcWeight.buffer, fcBias.buffer, fcOut, 1, this.styleHalf, fcOutDim, true);
 
       // Debug: FC output
-      await this.captureDebug(`/text_encoder/lstms.${2 * li + 1}/fc/Gemm_output_0`, fcOut, [1, 1024]);
+      await this.captureDebug(`/text_encoder/lstms.${2 * li + 1}/fc/Gemm_output_0`, fcOut, [1, fcOutDim]);
 
       // LayerNorm weights
       const lnIdx = 2 * li + 1;
@@ -609,26 +960,26 @@ export class KittenTTSEngine {
       const lnBeta = this.requireWeight(lnBetaName);
 
       // All-GPU: LayerNorm(lstm_output) → AdaIN(normed, fc_out) → predTextFeatures
-      // LayerNorm: LSTM output [seqLen, 512] → normed [seqLen, 512]
-      const normedLstm = this.createEmptyBuffer(seqLen * 512, `pred_ln${li}_out`);
-      this.dispatchLayerNorm(lstmOut, lnGamma.buffer, lnBeta.buffer, normedLstm, seqLen, 512, 1e-5);
+      // LayerNorm: LSTM output [seqLen, lstmBidir] → normed [seqLen, lstmBidir]
+      const normedLstm = this.createEmptyBuffer(seqLen * this.lstmBidir, `pred_ln${li}_out`);
+      this.dispatchLayerNorm(lstmOut, lnGamma.buffer, lnBeta.buffer, normedLstm, seqLen, this.lstmBidir, 1e-5);
       predIntermediates.push(lstmOut);
 
-      // AdaIN row-major: normed[seqLen,512] × fcOut[1024] → adainOut[seqLen,512]
-      const adainOut = this.createEmptyBuffer(seqLen * 512, `pred_adain${li}_out`);
-      this.dispatchAdaINRowMajor(normedLstm, fcOut, adainOut, 512, seqLen);
+      // AdaIN row-major: normed[seqLen,lstmBidir] × fcOut[2*lstmBidir] → adainOut[seqLen,lstmBidir]
+      const adainOut = this.createEmptyBuffer(seqLen * this.lstmBidir, `pred_adain${li}_out`);
+      this.dispatchAdaINRowMajor(normedLstm, fcOut, adainOut, this.lstmBidir, seqLen);
       predIntermediates.push(normedLstm, fcOut);
 
       // Debug: AdaIN output — matches /text_encoder/lstms.{2*li+1}/Add_2_output_0
-      await this.captureDebug(`/text_encoder/lstms.${2 * li + 1}/Add_2_output_0`, adainOut, [1, seqLen, 512]);
+      await this.captureDebug(`/text_encoder/lstms.${2 * li + 1}/Add_2_output_0`, adainOut, [1, seqLen, this.lstmBidir]);
 
       predIntermediates.push(predTextFeatures);
       predTextFeatures = adainOut;
       predIntermediates.push(lstmOut);
     }
 
-    // After predictor text encoder, we have predTextFeatures [seqLen, 512]
-    console.log(`[KittenTTS] Predictor text encoder output: [${seqLen}, 512]`);
+    // After predictor text encoder, we have predTextFeatures [seqLen, lstmBidir]
+    console.log(`[KittenTTS] Predictor text encoder output: [${seqLen}, ${this.lstmBidir}]`);
 
     await this.endStage('Predictor text encoder');
 
@@ -637,34 +988,34 @@ export class KittenTTSEngine {
     onProgress?.('5/8 Duration predictor'); console.log('[KittenTTS] Running duration predictor...');
 
     // ── Duration LSTM: predictor text encoder output → durations ──
-    // /lstm LSTM takes concat(pred_text_features[512], style_pred[128]) = [seqLen, 640]
+    // /lstm LSTM takes concat(pred_text_features[lstmBidir], style_pred[styleHalf]) = [seqLen, lstmInputSize]
     // Weights: onnx::LSTM_6243/6244/6242 (separate from shared LSTM 6292/6293/6291)
 
-    // Build concat input on GPU: predTextFeatures[seqLen,512] + stylePred[128] → [seqLen,640]
-    const durationLstmInput = this.createEmptyBuffer(seqLen * 640, 'duration_lstm_in');
-    this.dispatchConcatBroadcast(predTextFeatures, stylePred, durationLstmInput, seqLen, 512, 128);
+    // Build concat input on GPU: predTextFeatures[seqLen,lstmBidir] + stylePred[styleHalf] → [seqLen,lstmInputSize]
+    const durationLstmInput = this.createEmptyBuffer(seqLen * this.lstmInputSize, 'duration_lstm_in');
+    this.dispatchConcatBroadcast(predTextFeatures, stylePred, durationLstmInput, seqLen, this.lstmBidir, this.styleHalf);
 
     const durationLstmW = this.requireWeight('onnx::LSTM_6243_quantized');
     const durationLstmR = this.requireWeight('onnx::LSTM_6244_quantized');
     const durationLstmB = this.requireWeight('onnx::LSTM_6242');
 
-    // GPU LSTM for duration predictor (was cpuLSTM — switching to GPU dispatchLSTM)
-    const durationLstmOut = this.createEmptyBuffer(seqLen * 2 * 256, 'duration_lstm_out');
-    this.dispatchLSTM(durationLstmInput, durationLstmW.buffer, durationLstmR.buffer, durationLstmB.buffer, durationLstmOut, seqLen, 640, 256, 2);
+    // GPU LSTM for duration predictor
+    const durationLstmOut = this.createEmptyBuffer(seqLen * 2 * this.lstmHidden, 'duration_lstm_out');
+    this.dispatchLSTM(durationLstmInput, durationLstmW.buffer, durationLstmR.buffer, durationLstmB.buffer, durationLstmOut, seqLen, this.lstmInputSize, this.lstmHidden, 2);
     predIntermediates.push(durationLstmInput);
 
     // Debug: duration LSTM output — matches /lstm/LSTM_output_0
-    await this.captureDebug('/lstm/LSTM_output_0', durationLstmOut, [seqLen, 2, 1, 256]);
+    await this.captureDebug('/lstm/LSTM_output_0', durationLstmOut, [seqLen, 2, 1, this.lstmHidden]);
 
     // Debug: duration LSTM input
-    await this.captureDebug('/lstm/Transpose_output_0', durationLstmInput, [seqLen, 1, 640]);
+    await this.captureDebug('/lstm/Transpose_output_0', durationLstmInput, [seqLen, 1, this.lstmInputSize]);
 
-    // Duration projection: [seqLen, 512] × [512, 50] + bias[50] → sigmoid → ReduceSum(axis=-1)
-    // LSTM output is [seqLen, 2, 256] = [seqLen, 512] in memory
+    // Duration projection: [seqLen, lstmBidir] × [lstmBidir, 50] + bias[50] → sigmoid → ReduceSum(axis=-1)
+    // LSTM output is [seqLen, 2, lstmHidden] = [seqLen, lstmBidir] in memory
     const durProjWeight = this.requireWeight('onnx::MatMul_6245');
     const durProjBias = this.requireWeight('kmodel.predictor.duration_proj.linear_layer.bias');
     const durProjOut = this.createEmptyBuffer(seqLen * 50, 'dur_proj');
-    this.dispatchMatmul(durationLstmOut, durProjWeight.buffer, durProjBias.buffer, durProjOut, seqLen, 512, 50, true);
+    this.dispatchMatmul(durationLstmOut, durProjWeight.buffer, durProjBias.buffer, durProjOut, seqLen, this.lstmBidir, 50, true);
     predIntermediates.push(durationLstmOut);
 
     // Debug: duration projection output (before sigmoid)
@@ -708,52 +1059,52 @@ export class KittenTTSEngine {
     // Upload cumsum to GPU for length expansion shaders
     const cumsumBuf = this.createBuffer(cumsum, 'duration_cumsum', GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
 
-    // GPU length expansion: durationLstmInput [seqLen, 640] → [totalFrames, 640] row-major
-    const sharedLstmInput = this.createEmptyBuffer(totalFrames * 640, 'shared_lstm_in');
-    this.dispatchExpandRowMajor(durationLstmInput, cumsumBuf, sharedLstmInput, seqLen, 640, totalFrames);
+    // GPU length expansion: durationLstmInput [seqLen, lstmInputSize] → [totalFrames, lstmInputSize] row-major
+    const sharedLstmInput = this.createEmptyBuffer(totalFrames * this.lstmInputSize, 'shared_lstm_in');
+    this.dispatchExpandRowMajor(durationLstmInput, cumsumBuf, sharedLstmInput, seqLen, this.lstmInputSize, totalFrames);
 
-    // GPU length expansion with transpose: textEncoderOutput [seqLen, 512] → [512, totalFrames] channel-first
+    // GPU length expansion with transpose: textEncoderOutput [seqLen, lstmBidir] → [lstmBidir, totalFrames] channel-first
     // CRITICAL: Decoder input uses the BASE text encoder LSTM output (text_encoder/lstm),
     // NOT the predictor text encoder output. The ONNX model's MatMul_1 multiplies the
     // base text encoder LSTM output with the alignment matrix to produce expanded features.
-    const expandedTextFeatures = this.createEmptyBuffer(512 * totalFrames, 'expanded_text_features');
-    this.dispatchExpandChannelFirst(textEncoderOutput, cumsumBuf, expandedTextFeatures, seqLen, 512, totalFrames);
+    const expandedTextFeatures = this.createEmptyBuffer(this.lstmBidir * totalFrames, 'expanded_text_features');
+    this.dispatchExpandChannelFirst(textEncoderOutput, cumsumBuf, expandedTextFeatures, seqLen, this.lstmBidir, totalFrames);
     this.deferDestroy(textEncoderOutput); // No longer needed after expansion
     predIntermediates.push(cumsumBuf);
-    console.log(`[KittenTTS] Expanded features: [640, ${totalFrames}] for shared LSTM, [512, ${totalFrames}] for decoder`);
+    console.log(`[KittenTTS] Expanded features: [${this.lstmInputSize}, ${totalFrames}] for shared LSTM, [${this.lstmBidir}, ${totalFrames}] for decoder`);
 
-    // ── Shared LSTM: expanded features [totalFrames, 640] → [totalFrames, 512] ──
+    // ── Shared LSTM: expanded features [totalFrames, lstmInputSize] → [totalFrames, lstmBidir] ──
     const sharedLstmW = this.requireWeight('onnx::LSTM_6292_quantized');
     const sharedLstmR = this.requireWeight('onnx::LSTM_6293_quantized');
     const sharedLstmB = this.requireWeight('onnx::LSTM_6291');
-    const sharedLstmOut = this.createEmptyBuffer(totalFrames * 2 * 256, 'shared_lstm_out');
-    this.dispatchLSTM(sharedLstmInput, sharedLstmW.buffer, sharedLstmR.buffer, sharedLstmB.buffer, sharedLstmOut, totalFrames, 640, 256, 2);
+    const sharedLstmOut = this.createEmptyBuffer(totalFrames * 2 * this.lstmHidden, 'shared_lstm_out');
+    this.dispatchLSTM(sharedLstmInput, sharedLstmW.buffer, sharedLstmR.buffer, sharedLstmB.buffer, sharedLstmOut, totalFrames, this.lstmInputSize, this.lstmHidden, 2);
     predIntermediates.push(sharedLstmInput);
 
-    // Debug: shared LSTM output — matches /shared/LSTM_output_0 [totalFrames, 2, 1, 256]
-    await this.captureDebug('/shared/LSTM_output_0', sharedLstmOut, [totalFrames, 2, 1, 256]);
+    // Debug: shared LSTM output — matches /shared/LSTM_output_0 [totalFrames, 2, 1, lstmHidden]
+    await this.captureDebug('/shared/LSTM_output_0', sharedLstmOut, [totalFrames, 2, 1, this.lstmHidden]);
 
-    // Transpose shared LSTM output to channels-first: [totalFrames, 512] → [512, totalFrames]
-    const sharedTransposed = this.createEmptyBuffer(512 * totalFrames, 'shared_transposed');
-    this.dispatchTranspose(sharedLstmOut, sharedTransposed, totalFrames, 512);
+    // Transpose shared LSTM output to channels-first: [totalFrames, lstmBidir] → [lstmBidir, totalFrames]
+    const sharedTransposed = this.createEmptyBuffer(this.lstmBidir * totalFrames, 'shared_transposed');
+    this.dispatchTranspose(sharedLstmOut, sharedTransposed, totalFrames, this.lstmBidir);
     predIntermediates.push(sharedLstmOut);
 
-    // ── N predictor: 3 AdaIN ResNet blocks on shared LSTM output [512, totalFrames] ──
+    // ── N predictor: 3 AdaIN ResNet blocks on shared LSTM output [lstmBidir, totalFrames] ──
     this.beginBatch();
     // N.1 pool doubles temporal resolution: totalFrames → 2*totalFrames (e.g. 149→298)
     // N_proj outputs at doubled resolution, then N_conv stride-2 downsamples back
     const baseFrames = totalFrames; // Save original frame count for decoder
-    let nFeatures = sharedTransposed; // [512, baseFrames]
-    let nChannels = 512;
+    let nFeatures = sharedTransposed; // [lstmBidir, baseFrames]
+    let nChannels = this.lstmBidir;
     let nLength = baseFrames;
 
     for (let bi = 0; bi < 3; bi++) {
       const prefix = `kmodel.predictor.N.${bi}`;
-      const poolConfig = bi === 1 ? { weightName: `kmodel.predictor.N.1.pool.weight`, channels: 512 } : undefined;
+      const poolConfig = bi === 1 ? { weightName: `kmodel.predictor.N.1.pool.weight`, channels: this.predBlock0OutCh } : undefined;
       const result = await this.runAdaINResNetBlock(
         nFeatures, stylePred, nChannels, nLength,
         prefix, bi === 1, // block 1 has conv1x1 residual and channel reduction
-        bi === 0 ? 512 : 256, // output channels
+        bi === 0 ? this.predBlock0OutCh : this.predBlock1OutCh, // output channels
         poolConfig,
       );
       predIntermediates.push(nFeatures);
@@ -776,12 +1127,12 @@ export class KittenTTSEngine {
     this.endBatch();
     await this.endStage('Duration + N predictor');
 
-    // ── F0 Prediction: 3 AdaIN ResNet blocks on shared LSTM output [512, baseFrames] ──
+    // ── F0 Prediction: 3 AdaIN ResNet blocks on shared LSTM output [lstmBidir, baseFrames] ──
     this.startStage();
     this.beginBatch();
     onProgress?.('6/8 F0 predictor'); console.log('[KittenTTS] Running F0 predictor...');
-    let f0Features = sharedTransposed; // [512, baseFrames] — same input as N predictor
-    let f0Channels = 512;
+    let f0Features = sharedTransposed; // [lstmBidir, baseFrames] — same input as N predictor
+    let f0Channels = this.lstmBidir;
     let f0Length = baseFrames;
 
     // F0 predictor: 3 AdaIN ResNet blocks (same structure as N but separate weights)
@@ -789,11 +1140,11 @@ export class KittenTTSEngine {
     const f0Intermediates: GPUBuffer[] = [];
     for (let bi = 0; bi < 3; bi++) {
       const prefix = `kmodel.predictor.F0.${bi}`;
-      const poolConfig = bi === 1 ? { weightName: `kmodel.predictor.F0.1.pool.weight`, channels: 512 } : undefined;
+      const poolConfig = bi === 1 ? { weightName: `kmodel.predictor.F0.1.pool.weight`, channels: this.predBlock0OutCh } : undefined;
       const result = await this.runAdaINResNetBlock(
         f0Features, stylePred, f0Channels, f0Length,
         prefix, bi === 1, // block 1 has conv1x1 + channel reduction
-        bi === 0 ? 512 : 256,
+        bi === 0 ? this.predBlock0OutCh : this.predBlock1OutCh,
         poolConfig,
       );
       // Don't push sharedTransposed (bi=0) — it's already in predIntermediates
@@ -837,14 +1188,15 @@ export class KittenTTSEngine {
     const nConv = this.createEmptyBuffer(baseFrames, 'n_conv');
     this.dispatchConv1d(nProjOut, nConvWeight.buffer, nConvBias.buffer, nConv, 1, 1, 3, nLength, baseFrames, 1, 2, 1, true);
 
-    // Decoder input: concat(expanded_text_features[512], F0_conv[1], N_conv[1]) = [514, baseFrames]
+    // Decoder input: concat(expanded_text_features[lstmBidir], F0_conv[1], N_conv[1]) = [lstmBidir+2, baseFrames]
     // CRITICAL: uses expanded text features (MatMul_1 in ONNX), NOT shared LSTM output
-    const concat512f0 = this.createEmptyBuffer(513 * baseFrames, 'dec_concat_512f0');
-    this.dispatchConcatChannels(expandedTextFeatures, f0Conv, concat512f0, 512, 1, baseFrames);
-    const decoderInput = this.createEmptyBuffer(514 * baseFrames, 'decoder_input');
-    this.dispatchConcatChannels(concat512f0, nConv, decoderInput, 513, 1, baseFrames);
-    this.deferDestroy(concat512f0);
-    await this.captureDebug('/decoder/Concat_output_0', decoderInput, [1, 514, baseFrames]);
+    const decInputCh = this.lstmBidir + 2; // e.g. 514 for mini, 130 for nano
+    const concatMid = this.createEmptyBuffer((this.lstmBidir + 1) * baseFrames, 'dec_concat_mid');
+    this.dispatchConcatChannels(expandedTextFeatures, f0Conv, concatMid, this.lstmBidir, 1, baseFrames);
+    const decoderInput = this.createEmptyBuffer(decInputCh * baseFrames, 'decoder_input');
+    this.dispatchConcatChannels(concatMid, nConv, decoderInput, this.lstmBidir + 1, 1, baseFrames);
+    this.deferDestroy(concatMid);
+    await this.captureDebug('/decoder/Concat_output_0', decoderInput, [1, decInputCh, baseFrames]);
 
     // Cleanup predictor intermediates (no sync needed — GPU handles ordering)
     for (const buf of predIntermediates) this.deferDestroy(buf);
@@ -855,31 +1207,35 @@ export class KittenTTSEngine {
     // ── Decoder encode block ──
     let decFrames = baseFrames; // Track decoder frame count (doubles at decode.3)
     const encodeOut = await this.runDecoderBlock(
-      decoderInput, styleDec, 514, 1024, decFrames,
+      decoderInput, styleDec, decInputCh, this.decEncodeOutCh, decFrames,
       'kmodel.decoder.encode', true,
     );
     // Debug: decoder encode output (matches ONNX /decoder/encode/Div_output_0)
-    await this.captureDebug('/decoder/encode/Div_output_0', encodeOut, [1, 1024, decFrames]);
+    await this.captureDebug('/decoder/encode/Div_output_0', encodeOut, [1, this.decEncodeOutCh, decFrames]);
     this.deferDestroy(decoderInput);
 
     // ── Decoder decode blocks ──
-    // asr_res: conv1x1(512→64) applied to expanded text features [512, baseFrames]
+    // asr_res: conv1x1(lstmBidir→64) applied to expanded text features [lstmBidir, baseFrames]
     const asrResWeight = this.requireWeight('kmodel.decoder.asr_res.0.weight_quantized');
     const asrResBias = this.requireWeight('kmodel.decoder.asr_res.0.bias');
-    let asrResOut: GPUBuffer | undefined = this.createEmptyBuffer(64 * baseFrames, 'asr_res');
-    this.dispatchConv1d(expandedTextFeatures, asrResWeight.buffer, asrResBias.buffer, asrResOut, 512, 64, 1, baseFrames, baseFrames, 0, 1, 1, true);
+    const asrResCh = asrResBias.size; // 64 for both mini and nano
+    let asrResOut: GPUBuffer | undefined = this.createEmptyBuffer(asrResCh * baseFrames, 'asr_res');
+    this.dispatchConv1d(expandedTextFeatures, asrResWeight.buffer, asrResBias.buffer, asrResOut, this.lstmBidir, asrResCh, 1, baseFrames, baseFrames, 0, 1, 1, true);
     this.deferDestroy(expandedTextFeatures);
 
-    // Build 1090-channel input for decode blocks (all on GPU)
-    let decodeInput2 = this.buildDecodeInput(encodeOut, f0Conv, nConv, asrResOut, 1024, decFrames);
+    // Build decode input: concat features + asr_res + F0/N
+    let decodeInput2 = this.buildDecodeInput(encodeOut, f0Conv, nConv, asrResOut, this.decEncodeOutCh, decFrames, asrResCh);
     this.deferDestroy(encodeOut);
 
     let decodeOut: GPUBuffer = decodeInput2; // Will be reassigned in loop
 
+    // Decode input channels = decEncodeOutCh + asrResCh + 2 (F0 + N)
+    const decodeInCh = this.decEncodeOutCh + asrResCh + 2;
+
     for (let di = 0; di < 4; di++) {
       const prefix = `kmodel.decoder.decode.${di}`;
-      const outCh = di < 3 ? 1024 : 512;
-      const inCh = 1090; // All decode blocks take 1090
+      const outCh = di < 3 ? this.decDecodeOutCh : this.decDecode3OutCh;
+      const inCh = decodeInCh;
 
       if (di === 3) {
         // decode.3 has pool: depthwise ConvTranspose inside block, doubles temporal resolution
@@ -905,8 +1261,8 @@ export class KittenTTSEngine {
       this.flushBatchEncoder();
 
       if (di < 3) {
-        // Build next decode input: concat decode output[outCh] + asr_res[64] + F0/N[2]
-        decodeInput2 = this.buildDecodeInput(decodeOut, f0Conv, nConv, asrResOut ?? null, outCh, decFrames);
+        // Build next decode input: concat decode output[outCh] + asr_res + F0/N
+        decodeInput2 = this.buildDecodeInput(decodeOut, f0Conv, nConv, asrResOut ?? null, outCh, decFrames, asrResCh);
         this.deferDestroy(decodeOut);
       }
     }
@@ -917,8 +1273,8 @@ export class KittenTTSEngine {
 
     // Assign totalFrames to the new doubled value for the generator
     totalFrames = decFrames;
-    // decodeOut is the final decoder output [512, totalFrames] (after pool doubling)
-    console.log(`[KittenTTS] Decoder output: [512, ${totalFrames}]`);
+    // decodeOut is the final decoder output [decDecode3OutCh, totalFrames] (after pool doubling)
+    console.log(`[KittenTTS] Decoder output: [${this.decDecode3OutCh}, ${totalFrames}]`);
 
     await this.endStage('Decoder (5 blocks)');
 
@@ -927,8 +1283,8 @@ export class KittenTTSEngine {
     onProgress?.('8/8 HiFi-GAN'); console.log('[KittenTTS] Running HiFi-GAN...');
     this.beginBatch(); // Batch 1: LeakyReLU + ups.0
 
-    let genFeatures = decodeOut!; // [512, totalFrames]
-    let genChannels = 512;
+    let genFeatures = decodeOut!; // [decDecode3OutCh, totalFrames]
+    let genChannels = this.decDecode3OutCh;
     let genLength = totalFrames;
 
     // ── LeakyReLU(0.1) before ups.0 (ONNX: LeakyRelu_0 on decoder output) ──
@@ -937,17 +1293,17 @@ export class KittenTTSEngine {
     this.deferDestroy(genFeatures);
     genFeatures = preUps0Leaky;
 
-    // ── ups.0: ConvTranspose1d(512→256, k=20, stride=10, pad=5) ──
+    // ── ups.0: ConvTranspose1d(decDecode3OutCh→hifiUps0OutCh, k=20, stride=10, pad=5) ──
     const ups0Weight = this.requireWeight('kmodel.decoder.generator.ups.0.weight');
     const ups0Bias = this.requireWeight('kmodel.decoder.generator.ups.0.bias');
     // ONNX: stride=10, kernel=20, pads=[5,5]
     // output_length = (input_length - 1) * stride + kernel - 2*pad = (L-1)*10 + 20 - 10 = L*10
     const ups0Length = genLength * 10;
-    const ups0Out = this.createEmptyBuffer(256 * ups0Length, 'ups0');
-    this.dispatchConvTranspose1d(genFeatures, ups0Weight.buffer, ups0Bias.buffer, ups0Out, 512, 256, 20, genLength, ups0Length, 10, 5, true);
+    const ups0Out = this.createEmptyBuffer(this.hifiUps0OutCh * ups0Length, 'ups0');
+    this.dispatchConvTranspose1d(genFeatures, ups0Weight.buffer, ups0Bias.buffer, ups0Out, genChannels, this.hifiUps0OutCh, 20, genLength, ups0Length, 10, 5, true);
     this.deferDestroy(genFeatures);
     genFeatures = ups0Out;
-    genChannels = 256;
+    genChannels = this.hifiUps0OutCh;
     genLength = ups0Length;
     console.log(`[KittenTTS] ups.0 output: [${genChannels}, ${genLength}]`);
 
@@ -966,15 +1322,15 @@ export class KittenTTSEngine {
 
     this.beginBatch(); // Batch 2: noise_convs + resblocks + ups.1 + conv_post
 
-    // ── noise_convs.0: Conv1d(22→256, k=12, stride=6, pad=3) → [256, ups0Length] ──
+    // ── noise_convs.0: Conv1d(22→hifiUps0OutCh, k=12, stride=6, pad=3) → [hifiUps0OutCh, ups0Length] ──
     const nc0Weight = this.requireWeight('kmodel.decoder.generator.noise_convs.0.weight_quantized');
     const nc0Bias = this.requireWeight('kmodel.decoder.generator.noise_convs.0.bias');
     const nc0Len = Math.floor((stftLen + 2 * 3 - 12) / 6) + 1; // should equal genLength (ups0Length)
-    const nc0Out = this.createEmptyBuffer(256 * nc0Len, 'noise_convs0');
-    this.dispatchConv1d(noiseInput, nc0Weight.buffer, nc0Bias.buffer, nc0Out, 22, 256, 12, stftLen, nc0Len, 3, 6, 1, true);
+    const nc0Out = this.createEmptyBuffer(this.hifiUps0OutCh * nc0Len, 'noise_convs0');
+    this.dispatchConv1d(noiseInput, nc0Weight.buffer, nc0Bias.buffer, nc0Out, 22, this.hifiUps0OutCh, 12, stftLen, nc0Len, 3, 6, 1, true);
 
     // ── noise_res.0: 3-iteration AdaIN ResBlock (same as HiFi-GAN resblocks) ──
-    const nr0Out = await this.runHiFiGANResBlock(nc0Out, styleDec, 256, nc0Len, 'kmodel.decoder.generator.noise_res.0');
+    const nr0Out = await this.runHiFiGANResBlock(nc0Out, styleDec, this.hifiUps0OutCh, nc0Len, 'kmodel.decoder.generator.noise_res.0');
     this.deferDestroy(nc0Out);
 
     // ── Add_3: noise_res.0 output + ups.0 output (noise added BEFORE resblocks) ──
@@ -1013,17 +1369,17 @@ export class KittenTTSEngine {
     this.deferDestroy(genFeatures);
     genFeatures = preUps1Leaky;
 
-    // ── ups.1: ConvTranspose1d(256→128, k=12, stride=6, pad=3) ──
+    // ── ups.1: ConvTranspose1d(hifiUps0OutCh→hifiUps1OutCh, k=12, stride=6, pad=3) ──
     const ups1Weight = this.requireWeight('kmodel.decoder.generator.ups.1.weight');
     const ups1Bias = this.requireWeight('kmodel.decoder.generator.ups.1.bias');
     // ONNX: stride=6, kernel=12, pads=[3,3]
     // output_length = (L-1)*6 + 12 - 6 = L*6
     const ups1Length = genLength * 6;
-    const ups1Out = this.createEmptyBuffer(128 * ups1Length, 'ups1');
-    this.dispatchConvTranspose1d(genFeatures, ups1Weight.buffer, ups1Bias.buffer, ups1Out, 256, 128, 12, genLength, ups1Length, 6, 3, true);
+    const ups1Out = this.createEmptyBuffer(this.hifiUps1OutCh * ups1Length, 'ups1');
+    this.dispatchConvTranspose1d(genFeatures, ups1Weight.buffer, ups1Bias.buffer, ups1Out, genChannels, this.hifiUps1OutCh, 12, genLength, ups1Length, 6, 3, true);
     this.deferDestroy(genFeatures);
     genFeatures = ups1Out;
-    genChannels = 128;
+    genChannels = this.hifiUps1OutCh;
     genLength = ups1Length;
     console.log(`[KittenTTS] ups.1 output: [${genChannels}, ${genLength}]`);
 
@@ -1046,15 +1402,15 @@ export class KittenTTSEngine {
     }
     console.log(`[KittenTTS] After reflection pad: [${genChannels}, ${genLength}]`);
 
-    // ── noise_convs.1: Conv1d(22→128, k=1, stride=1, pad=0) → [128, stftLen] ──
+    // ── noise_convs.1: Conv1d(22→hifiUps1OutCh, k=1, stride=1, pad=0) → [hifiUps1OutCh, stftLen] ──
     const nc1Weight = this.requireWeight('kmodel.decoder.generator.noise_convs.1.weight_quantized');
     const nc1Bias = this.requireWeight('kmodel.decoder.generator.noise_convs.1.bias');
-    const nc1Out = this.createEmptyBuffer(128 * stftLen, 'noise_convs1');
-    this.dispatchConv1d(noiseInput, nc1Weight.buffer, nc1Bias.buffer, nc1Out, 22, 128, 1, stftLen, stftLen, 0, 1, 1, true);
+    const nc1Out = this.createEmptyBuffer(this.hifiUps1OutCh * stftLen, 'noise_convs1');
+    this.dispatchConv1d(noiseInput, nc1Weight.buffer, nc1Bias.buffer, nc1Out, 22, this.hifiUps1OutCh, 1, stftLen, stftLen, 0, 1, 1, true);
     this.deferDestroy(noiseInput); // Done with noise source
 
     // ── noise_res.1: 3-iteration AdaIN ResBlock ──
-    const nr1Out = await this.runHiFiGANResBlock(nc1Out, styleDec, 128, stftLen, 'kmodel.decoder.generator.noise_res.1');
+    const nr1Out = await this.runHiFiGANResBlock(nc1Out, styleDec, this.hifiUps1OutCh, stftLen, 'kmodel.decoder.generator.noise_res.1');
     this.deferDestroy(nc1Out);
 
     // ── Add_5: noise_res.1 output + reflection_pad output (noise added BEFORE resblocks) ──
@@ -1087,7 +1443,7 @@ export class KittenTTSEngine {
     // Flush to free resblocks.2+3 intermediates before conv_post
     this.flushBatchEncoder();
 
-    // ── LeakyReLU + conv_post: conv(128→22, k=7) ──
+    // ── LeakyReLU + conv_post: conv(hifiUps1OutCh→22, k=7) ──
     const postLeaky = this.createEmptyBuffer(genChannels * genLength, 'post_leaky');
     this.dispatchLeakyRelu(genFeatures, postLeaky, genChannels * genLength, 0.01);
     this.deferDestroy(genFeatures);
@@ -1095,7 +1451,7 @@ export class KittenTTSEngine {
     const convPostWeight = this.requireWeight('kmodel.decoder.generator.conv_post.weight_quantized');
     const convPostBias = this.requireWeight('kmodel.decoder.generator.conv_post.bias');
     const convPostOut = this.createEmptyBuffer(22 * genLength, 'conv_post');
-    this.dispatchConv1d(postLeaky, convPostWeight.buffer, convPostBias.buffer, convPostOut, 128, 22, 7, genLength, genLength, 3, 1, 1, true);
+    this.dispatchConv1d(postLeaky, convPostWeight.buffer, convPostBias.buffer, convPostOut, genChannels, 22, 7, genLength, genLength, 3, 1, 1, true);
     this.deferDestroy(postLeaky);
 
     this.endBatch(); // Flush final conv_post
@@ -1311,17 +1667,10 @@ export class KittenTTSEngine {
 
   /** Get a weight tensor, throwing a descriptive error if missing.
    *  Handles cross-model weight name differences: micro/nano models may store
-   *  some weights with/without `_quantized` suffix depending on their quantization. */
+   *  some weights with/without `_quantized` suffix depending on their quantization.
+   *  Also checks onnx:: weight aliases for cross-model-size compatibility. */
   private requireWeight(name: string): GpuTensor {
-    let w = this.weights.get(name);
-    if (!w && name.endsWith('_quantized')) {
-      // Micro/nano may store these as f16/f32 (no _quantized suffix)
-      w = this.weights.get(name.slice(0, -'_quantized'.length));
-    }
-    if (!w && !name.endsWith('_quantized')) {
-      // Micro may quantize weights that mini stores as f16
-      w = this.weights.get(name + '_quantized');
-    }
+    const w = this.tryGetWeight(name);
     if (!w) throw new Error(`[KittenTTS] Missing weight: ${name}`);
     return w;
   }
@@ -1518,12 +1867,12 @@ export class KittenTTSEngine {
    * 5. Return [1, seqLen, 768]
    */
   private runBertEncoder(inputIdsBuf: GPUBuffer, embeddingSum: GPUBuffer, seqLen: number): GPUBuffer {
-    const embedDim = 128;
-    const hiddenSize = 768;
-    const numHeads = 12;
-    const headDim = 64;
-    const ffnDim = 2048;
-    const numLayers = 12;
+    const embedDim = this.bertEmbedDim;
+    const hiddenSize = this.bertHiddenSize;
+    const numHeads = this.bertNumHeads;
+    const headDim = this.bertHeadDim;
+    const ffnDim = this.bertFfnDim;
+    const numLayers = this.bertNumLayers;
     const eps = 1e-12; // BERT default epsilon
 
     // Single command encoder for the entire BERT forward pass.
@@ -1664,19 +2013,19 @@ export class KittenTTSEngine {
    * Run the text encoder.
    *
    * Pipeline:
-   * 1. Embedding lookup: input_ids → [seqLen, 512]
-   * 2. Transpose to channels-first: [512, seqLen]
-   * 3. 3× Conv1d(512, 512, k=5, pad=2) + LayerNorm + LeakyReLU
-   * 4. Transpose to [seqLen, 512] for LSTM input
-   * 5. Bidirectional LSTM (hidden=256) → [seqLen, 2, 256]
+   * 1. Embedding lookup: input_ids → [seqLen, textEncChannels]
+   * 2. Transpose to channels-first: [textEncChannels, seqLen]
+   * 3. N× Conv1d(C, C, k=5, pad=2) + LayerNorm + LeakyReLU (N=numTextEncCnnBlocks)
+   * 4. Transpose to [seqLen, textEncChannels] for LSTM input
+   * 5. Bidirectional LSTM (hidden=lstmHidden) → [seqLen, 2, lstmHidden]
    *
-   * Returns buffer with shape [seqLen, 2, 256] (= [seqLen, 512] flattened)
+   * Returns buffer with shape [seqLen, 2, lstmHidden] (= [seqLen, lstmBidir] flattened)
    */
   private async runTextEncoder(inputIdsBuf: GPUBuffer, seqLen: number): Promise<GPUBuffer> {
-    const channels = 512;
+    const channels = this.textEncChannels;
     const kernelSize = 5;
     const padding = 2;
-    const hiddenSize = 256;
+    const hiddenSize = this.lstmHidden;
     const numDirections = 2;
 
     const intermediates: GPUBuffer[] = [];
@@ -1697,10 +2046,10 @@ export class KittenTTSEngine {
     // Debug: transposed embedding (conv input) — should match /text_encoder/Transpose_output_0 [1, 512, seqLen]
     await this.captureDebug('/text_encoder/Transpose_output_0', transposed, [1, channels, seqLen]);
 
-    // ── Step 3: 3× Conv1d blocks ──
+    // ── Step 3: N× Conv1d blocks (mini=3, nano=2) ──
     let convInput = transposed;
 
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < this.numTextEncCnnBlocks; i++) {
       const convWeight = this.requireWeight(`kmodel.text_encoder.cnn.${i}.0.weight_quantized`);
       const convBias = this.requireWeight(`kmodel.text_encoder.cnn.${i}.0.bias`);
 
@@ -2148,11 +2497,11 @@ export class KittenTTSEngine {
     const norm1Out = this.createEmptyBuffer(inChannels * curLength, 'adain_norm1');
     this.dispatchInstanceNorm(input, norm1Out, inChannels, curLength, 1e-5);
 
-    // AdaIN FC: style[128] → [2*inChannels] via FC weight/bias
+    // AdaIN FC: style[styleHalf] → [2*inChannels] via FC weight/bias
     const norm1FcWeight = this.requireWeight(`${prefix}.norm1.fc.weight_quantized`);
     const norm1FcBias = this.requireWeight(`${prefix}.norm1.fc.bias`);
     const norm1Style = this.createEmptyBuffer(norm1FcBias.size, 'norm1_style');
-    this.dispatchMatmul(style, norm1FcWeight.buffer, norm1FcBias.buffer, norm1Style, 1, 128, norm1FcBias.size, true);
+    this.dispatchMatmul(style, norm1FcWeight.buffer, norm1FcBias.buffer, norm1Style, 1, this.styleHalf, norm1FcBias.size, true);
 
     const adain1Out = this.createEmptyBuffer(inChannels * curLength, 'adain1_out');
     this.dispatchAdaIN(norm1Out, norm1Style, adain1Out, inChannels, curLength);
@@ -2191,7 +2540,7 @@ export class KittenTTSEngine {
     const norm2FcWeight = this.requireWeight(`${prefix}.norm2.fc.weight_quantized`);
     const norm2FcBias = this.requireWeight(`${prefix}.norm2.fc.bias`);
     const norm2Style = this.createEmptyBuffer(norm2FcBias.size, 'norm2_style');
-    this.dispatchMatmul(style, norm2FcWeight.buffer, norm2FcBias.buffer, norm2Style, 1, 128, norm2FcBias.size, true);
+    this.dispatchMatmul(style, norm2FcWeight.buffer, norm2FcBias.buffer, norm2Style, 1, this.styleHalf, norm2FcBias.size, true);
 
     const adain2Out = this.createEmptyBuffer(outChannels * curLength, 'adain2_out');
     this.dispatchAdaIN(norm2Out, norm2Style, adain2Out, outChannels, curLength);
@@ -2278,7 +2627,7 @@ export class KittenTTSEngine {
     const norm1FcBias = this.requireWeight(`${prefix}.norm1.fc.bias`);
     const norm1FcOutSize = norm1FcBias.size;
     const norm1Style = this.createEmptyBuffer(norm1FcOutSize, 'dec_norm1_style');
-    this.dispatchMatmul(style, norm1FcWeight.buffer, norm1FcBias.buffer, norm1Style, 1, 128, norm1FcOutSize, true);
+    this.dispatchMatmul(style, norm1FcWeight.buffer, norm1FcBias.buffer, norm1Style, 1, this.styleHalf, norm1FcOutSize, true);
 
     const adain1Out = this.createEmptyBuffer(inChannels * curLength, 'dec_adain1');
     this.dispatchAdaIN(norm1Out, norm1Style, adain1Out, inChannels, curLength);
@@ -2317,7 +2666,7 @@ export class KittenTTSEngine {
     const norm2FcBias = this.requireWeight(`${prefix}.norm2.fc.bias`);
     const norm2FcOutSize = norm2FcBias.size;
     const norm2Style = this.createEmptyBuffer(norm2FcOutSize, 'dec_norm2_style');
-    this.dispatchMatmul(style, norm2FcWeight.buffer, norm2FcBias.buffer, norm2Style, 1, 128, norm2FcOutSize, true);
+    this.dispatchMatmul(style, norm2FcWeight.buffer, norm2FcBias.buffer, norm2Style, 1, this.styleHalf, norm2FcOutSize, true);
 
     const adain2Out = this.createEmptyBuffer(outChannels * curLength, 'dec_adain2');
     this.dispatchAdaIN(norm2Out, norm2Style, adain2Out, outChannels, curLength);
@@ -2379,21 +2728,22 @@ export class KittenTTSEngine {
     asrRes: GPUBuffer | null,
     featureChannels: number,
     length: number,
+    asrChannels = 64,
   ): GPUBuffer {
-    // Total channels: featureChannels + 64 (asr_res) + 2 (F0 + N) = featureChannels + 66
+    // Total channels: featureChannels + asrChannels + 2 (F0 + N)
     // Chain GPU concat: features+asrRes → concat1, concat1+f0 → concat2, concat2+n → final
-    const asrBuf = asrRes ?? this.createEmptyBuffer(64 * length, 'asr_zero');
+    const asrBuf = asrRes ?? this.createEmptyBuffer(asrChannels * length, 'asr_zero');
 
-    // Step 1: features[featureChannels] + asrRes[64]
-    const concat1 = this.createEmptyBuffer((featureChannels + 64) * length, 'dec_concat1');
-    this.dispatchConcatChannels(features, asrBuf, concat1, featureChannels, 64, length);
+    // Step 1: features[featureChannels] + asrRes[asrChannels]
+    const concat1 = this.createEmptyBuffer((featureChannels + asrChannels) * length, 'dec_concat1');
+    this.dispatchConcatChannels(features, asrBuf, concat1, featureChannels, asrChannels, length);
 
-    // Step 2: concat1[featureChannels+64] + f0[1]
-    const concat2 = this.createEmptyBuffer((featureChannels + 65) * length, 'dec_concat2');
-    this.dispatchConcatChannels(concat1, f0Conv, concat2, featureChannels + 64, 1, length);
-    // Step 3: concat2[featureChannels+65] + n[1]
-    const output = this.createEmptyBuffer((featureChannels + 66) * length, 'dec_concat3');
-    this.dispatchConcatChannels(concat2, nConv, output, featureChannels + 65, 1, length);
+    // Step 2: concat1 + f0[1]
+    const concat2 = this.createEmptyBuffer((featureChannels + asrChannels + 1) * length, 'dec_concat2');
+    this.dispatchConcatChannels(concat1, f0Conv, concat2, featureChannels + asrChannels, 1, length);
+    // Step 3: concat2 + n[1]
+    const output = this.createEmptyBuffer((featureChannels + asrChannels + 2) * length, 'dec_concat3');
+    this.dispatchConcatChannels(concat2, nConv, output, featureChannels + asrChannels + 1, 1, length);
     this.deferDestroy(concat1);
     this.deferDestroy(concat2);
     if (!asrRes) this.deferDestroy(asrBuf);
@@ -2436,7 +2786,7 @@ export class KittenTTSEngine {
       const adain1FcWeight = this.requireWeight(`${prefix}.adain1.${i}.fc.weight_quantized`);
       const adain1FcBias = this.requireWeight(`${prefix}.adain1.${i}.fc.bias`);
       const adain1Style = this.poolGet(adain1FcBias.size, `hifi_adain1_style_${i}`);
-      this.dispatchMatmul(style, adain1FcWeight.buffer, adain1FcBias.buffer, adain1Style, 1, 128, adain1FcBias.size, true);
+      this.dispatchMatmul(style, adain1FcWeight.buffer, adain1FcBias.buffer, adain1Style, 1, this.styleHalf, adain1FcBias.size, true);
 
       const adain1Out = this.poolGet(channels * length, `hifi_adain1_${i}`);
       this.dispatchAdaIN(norm1, adain1Style, adain1Out, channels, length);
@@ -2465,7 +2815,7 @@ export class KittenTTSEngine {
       const adain2FcWeight = this.requireWeight(`${prefix}.adain2.${i}.fc.weight_quantized`);
       const adain2FcBias = this.requireWeight(`${prefix}.adain2.${i}.fc.bias`);
       const adain2Style = this.poolGet(adain2FcBias.size, `hifi_adain2_style_${i}`);
-      this.dispatchMatmul(style, adain2FcWeight.buffer, adain2FcBias.buffer, adain2Style, 1, 128, adain2FcBias.size, true);
+      this.dispatchMatmul(style, adain2FcWeight.buffer, adain2FcBias.buffer, adain2Style, 1, this.styleHalf, adain2FcBias.size, true);
 
       const adain2Out = this.poolGet(channels * length, `hifi_adain2_${i}`);
       this.dispatchAdaIN(norm2, adain2Style, adain2Out, channels, length);
