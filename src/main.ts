@@ -66,6 +66,8 @@ function updateModelInfo() {
   const m = getSelectedModel();
   loadingSubtitle.textContent = `${m.params} parameter text-to-speech · WebGPU`;
   startSubtext.innerHTML = `Downloads ${m.size} model to run locally in your browser.<br>No data leaves your device.`;
+  modelIndicator.textContent = `${m.key.charAt(0).toUpperCase() + m.key.slice(1)} ${m.params}`;
+  modelIndicator.style.opacity = '1';
 }
 modelSelect.addEventListener('change', updateModelInfo);
 updateModelInfo();
@@ -416,9 +418,6 @@ generateBtn.addEventListener('click', async () => {
     }
 
     // Update metadata
-    const m = getSelectedModel();
-    modelIndicator.textContent = `${m.key.charAt(0).toUpperCase() + m.key.slice(1)} ${m.params}`;
-    modelIndicator.style.opacity = '1';
     metaDuration.textContent = `${duration}s`;
     metaSpeed.textContent = `${elapsed}s`;
     metaSamples.textContent = waveform.length.toLocaleString();
