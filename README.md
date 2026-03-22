@@ -1,20 +1,13 @@
-# WebGPU Kitten TTS
+# Kitten TTS WebGPU
 
-**80M-parameter text-to-speech running entirely in the browser via WebGPU compute shaders. No ONNX Runtime. No C++ inference engines. Just TypeScript and WGSL.**
+[![npm](https://img.shields.io/npm/v/kitten-tts-webgpu)](https://www.npmjs.com/package/kitten-tts-webgpu)
+[![license](https://img.shields.io/npm/l/kitten-tts-webgpu)](./LICENSE)
 
-[**Live Demo**](https://svenflow.github.io/kitten-tts-webgpu/) | [Model Card](https://huggingface.co/KittenML/kitten-tts-mini-0.8)
+**Pure WebGPU text-to-speech for the browser. 80M params, sub-second on desktop, ~1.2s on iPhone. No ONNX Runtime, no WASM inference — just 29 compute shaders.**
+
+[**Live Demo**](https://svenflow.github.io/kitten-tts-webgpu/) | [npm](https://www.npmjs.com/package/kitten-tts-webgpu) | [Model Card](https://huggingface.co/KittenML/kitten-tts-mini-0.8)
 
 ---
-
-## What is this?
-
-A from-scratch neural TTS inference engine where 100% of the model execution happens on the GPU via [WebGPU](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API) compute shaders. The entire 80M-parameter [Kitten TTS](https://huggingface.co/KittenML/kitten-tts-mini-0.8) model -- BERT encoder, duration predictor, acoustic decoder, and HiFi-GAN vocoder -- runs as GPU dispatches through 20+ hand-written WGSL shaders. No server, no ONNX Runtime, no heavyweight tensor libraries.
-
-- **~1.2s** generation on iPhone 17 Pro Max (Safari, iOS 26)
-- **Sub-second** on desktop GPUs
-- **74.6 MB** model, loaded once from HuggingFace CDN
-- **8 voices** (4 female, 4 male) with adjustable speed
-- **No ML framework overhead** -- only `phonemizer` (espeak-ng WASM, for text-to-phoneme conversion)
 
 ## Quick Start
 
@@ -26,47 +19,77 @@ npm install kitten-tts-webgpu
 import { textToSpeech } from 'kitten-tts-webgpu';
 
 const blob = await textToSpeech("The quick brown fox jumps over the lazy dog.");
-
-// Play it
 const audio = new Audio(URL.createObjectURL(blob));
 audio.play();
 ```
 
-One function, one line, WAV audio out. The model is initialized on the first call and cached for subsequent calls.
+One function. Text in, WAV blob out (16-bit PCM, 24 kHz mono). The model downloads on first call and is cached for subsequent calls. Full TypeScript types included.
 
-## Usage
+> **Note:** This library requires WebGPU. For server-side rendering frameworks (Next.js, Nuxt), dynamically import on the client side only.
 
-### Basic
+## Models
+
+Three [Kitten TTS v0.8](https://huggingface.co/KittenML) sizes, same API:
+
+| Model | Params | Download | M4 Pro (Chrome) | iPhone 17 Pro Max |
+|-------|--------|----------|------------------|-------------------|
+| **Mini** | 80M | 78 MB | 1.80s (3.3x RT) | ~1.2s |
+| **Micro** | 40M | 41 MB | 1.05s (6.2x RT) | untested |
+| **Nano** | 15M | 24 MB | 0.93s (7.3x RT) | untested |
+
+*RT = real-time multiplier (audio duration / generation time). Higher is better. Times are warm (model cached in GPU). First call includes ~2-4s model download.*
 
 ```typescript
-const blob = await textToSpeech("Hello world");
+await textToSpeech("Hello world");                        // Default: mini
+await textToSpeech("Hello world", { model: 'micro' });    // Balanced
+await textToSpeech("Hello world", { model: 'nano' });     // Fastest
 ```
 
-### Custom voice and speed
+## Options
 
 ```typescript
-const blob = await textToSpeech("Welcome to the future of browser TTS.", {
-  voice: "Leo",
-  speed: 1.2,
+const blob = await textToSpeech("Welcome to the future.", {
+  voice: "Leo",        // 8 voices: Bella, Luna, Rosie, Kiki, Jasper, Bruno, Hugo, Leo
+  speed: 1.2,          // 0.5x – 2.0x
+  model: "micro",      // mini | micro | nano
+  onProgress: (stage) => console.log(stage), // string: "Initializing WebGPU…", "Downloading…", "Generating speech…", etc.
 });
 ```
 
-### Progress callback
+### Voices
+
+| Female | Male |
+|--------|------|
+| Bella  | Jasper |
+| Luna   | Bruno |
+| Rosie  | Hugo |
+| Kiki   | Leo |
+
+## Error Handling
 
 ```typescript
-const blob = await textToSpeech("Generating speech with progress updates.", {
-  onProgress: (stage) => console.log(stage),
-  // Logs: "Initializing WebGPU…", "Downloading model…", "Phonemizing…",
-  //       "Generating speech…", "Encoding WAV…"
-});
+// Check for WebGPU support
+if (!navigator.gpu) {
+  console.log("WebGPU not available — use Chrome 113+, Edge 113+, or Safari 26+");
+}
+
+// textToSpeech throws on:
+// - No WebGPU support
+// - Network error (model download fails)
+// - Empty text input
+try {
+  const blob = await textToSpeech("Hello");
+} catch (err) {
+  console.error("TTS failed:", err.message);
+}
 ```
 
-### Direct engine access
+## Advanced: Direct Engine Access
 
-For repeated generations or fine-grained control, use the engine directly:
+For repeated generations or fine-grained control:
 
 ```typescript
-import { KittenTTSEngine, textToInputIds } from 'kitten-tts-webgpu';
+import { KittenTTSEngine, textToInputIds, float32ToWav } from 'kitten-tts-webgpu';
 
 const engine = new KittenTTSEngine();
 await engine.init();
@@ -74,79 +97,55 @@ await engine.loadModel(onnxUrl, voicesUrl);
 
 const { ids } = await textToInputIds("Hello world");
 const { waveform } = await engine.generate(ids, "Bella", 1.0);
-// waveform is a Float32Array of 24kHz PCM samples
+// waveform: Float32Array of 24kHz PCM samples
+
+const wavBlob = float32ToWav(waveform, 24000);
 ```
 
-## Voices
+## How It Works
 
-| Name   | Gender | ID               |
-|--------|--------|------------------|
-| Bella  | F      | expr-voice-2-f   |
-| Luna   | F      | expr-voice-3-f   |
-| Rosie  | F      | expr-voice-4-f   |
-| Kiki   | F      | expr-voice-5-f   |
-| Jasper | M      | expr-voice-2-m   |
-| Bruno  | M      | expr-voice-3-m   |
-| Hugo   | M      | expr-voice-4-m   |
-| Leo    | M      | expr-voice-5-m   |
-
-Pass the name (e.g. `"Bella"`) or the raw ID (e.g. `"expr-voice-2-f"`) to the `voice` option.
-
-## Architecture
-
-The inference pipeline has four stages. All neural network computation runs as WebGPU compute shader dispatches -- no CPU-side tensor math, no ONNX Runtime, no WASM inference.
+29 hand-written [WGSL compute shaders](./src/shaders.ts) execute the full TTS pipeline on GPU:
 
 ```
-Text
- |  Phonemizer (espeak-ng WASM + 234K-word dictionary fallback)
- v
-Phoneme IDs
- |  ALBERT-based BERT encoder
- |  (embedding, multi-head attention, feed-forward)
- v
-Hidden States
- |  Duration predictor (LSTM + CNN) --> per-phoneme durations
- |  Acoustic decoder (LSTM + AdaIN + CNN, style-conditioned)
- v
-Mel Spectrogram
- |  HiFi-GAN vocoder
- |  (transposed convolutions, Snake activations, residual blocks, iSTFT)
- v
-24kHz Waveform (WAV)
+Text → Phonemes (234K-word dictionary + espeak rules in pure JS)
+  → ALBERT encoder (embedding, multi-head attention, FFN)
+  → Duration predictor (LSTM + CNN)
+  → Acoustic decoder (LSTM + AdaIN + CNN, style-conditioned)
+  → HiFi-GAN vocoder (ConvTranspose1d, Snake activations, iSTFT)
+  → 24kHz WAV
 ```
 
-### What makes this different
+**Why not ONNX Runtime Web?**
 
-Most browser-based ML projects use ONNX Runtime Web (a large C++/WASM runtime) or similar frameworks to execute models. This project takes a fundamentally different approach:
+Most browser TTS uses ONNX Runtime Web (~2MB WASM binary + C++ runtime). This project takes a different approach:
 
-- **Custom ONNX parser** written in TypeScript extracts and dequantizes weights (int8/uint8/float16) directly -- no C++ runtime needed.
-- **20+ hand-written WGSL compute shaders** implement every operation from scratch: embedding lookup, layer normalization, matrix multiplication, multi-head attention, Conv1d, ConvTranspose1d, LSTM, instance normalization, adaptive instance normalization (AdaIN), GELU, LeakyReLU, Snake activation, softmax, iSTFT, and more.
-- **Buffer pooling and memory management** tuned for iOS Safari's Metal backend, keeping peak GPU memory under control to prevent jetsam kills on mobile devices.
-
-The result is a lean, zero-bloat inference engine with no framework overhead.
+- **Custom ONNX parser** — dequantizes int8/uint8/float16 weights in pure TypeScript, no C++ runtime
+- **234K-word phonemizer** — espeak-ng rules ported to pure JS (WASM espeak hangs on iOS Safari)
+- **GPU buffer pooling** — reuses buffers across HiFi-GAN iterations, ~130MB peak on mobile
+- **Dynamic architecture** — detects model dimensions from weight shapes, one engine for all 3 sizes
 
 ## Browser Support
 
-| Browser                | Status              |
-|------------------------|---------------------|
-| Chrome 113+            | Supported           |
-| Edge 113+              | Supported           |
-| Safari 26+ (macOS)     | Supported (WebGPU)  |
-| Safari 26+ (iOS)       | Supported (WebGPU)  |
-| Firefox Nightly        | Experimental        |
+| Browser | Status |
+|---------|--------|
+| Chrome 113+ | ✅ |
+| Edge 113+ | ✅ |
+| Safari 26+ (macOS/iOS) | ✅ |
+| Firefox Nightly | Experimental |
 
-WebGPU is required. Safari gained WebGPU support in version 26 (iOS 26 / macOS 26), making this the first generation of iPhones and iPads that can run full neural network inference natively in the browser.
+## FAQ
 
-## Performance
+**Max input length?** Recommended under ~500 characters per call. For longer text, split into sentences.
 
-Benchmarked on real hardware, measuring time from `generate()` call to waveform output (excludes one-time model loading):
+**Languages?** English only (matches the upstream Kitten TTS model).
 
-| Device                  | Time     |
-|-------------------------|----------|
-| iPhone 17 Pro Max       | ~1.24s   |
-| Desktop GPU (M-series)  | < 1s     |
+**Offline?** Yes, after the model is cached in the browser. No server needed for inference.
 
-Model loading (first run only): ~2-4s depending on network speed. The 74.6 MB ONNX model and 3.1 MB voice embeddings are fetched from HuggingFace CDN.
+**Self-hosting models?** Pass custom URLs to `KittenTTSEngine.loadModel(onnxUrl, voicesUrl)`.
+
+**Bundle size?** ~750KB gzipped (includes engine, shaders, and 234K-word phonemizer dictionary). Model weights (24-78MB) download separately at runtime.
+
+**Model license?** Kitten TTS models are released under [Apache 2.0](https://huggingface.co/KittenML/kitten-tts-mini-0.8). Code in this repo is MIT.
 
 ## Development
 
@@ -154,31 +153,16 @@ Model loading (first run only): ~2-4s depending on network speed. The 74.6 MB ON
 git clone https://github.com/svenflow/kitten-tts-webgpu.git
 cd kitten-tts-webgpu
 npm install
-npm run dev
-```
-
-For local development with model files, place them in `models/kitten-tts-mini-0.8/`:
-- `kitten_tts_mini_v0_8.onnx` (74.6 MB)
-- `voices.npz` (3.1 MB)
-
-### Build
-
-```bash
-npm run build
-npm run preview
-```
-
-### Tests
-
-```bash
-npm test
+npm run dev       # Dev server
+npm run build     # Production build
+npm test          # Phonemizer tests
 ```
 
 ## Credits
 
-- [Kitten TTS](https://huggingface.co/KittenML/kitten-tts-mini-0.8) model by KittenML
-- [phonemizer](https://www.npmjs.com/package/phonemizer) (espeak-ng WASM) by Xenova
-- WebGPU inference engine by [svenflow](https://github.com/svenflow)
+- [Kitten TTS](https://huggingface.co/KittenML/kitten-tts-mini-0.8) models by KittenML (Apache 2.0)
+- [espeak-ng](https://github.com/espeak-ng/espeak-ng) pronunciation dictionary and letter-to-sound rules (GPL-3.0, bundled as data files)
+- [phonemizer](https://www.npmjs.com/package/phonemizer) by Xenova (espeak-ng WASM, used as primary backend on Chrome/Firefox; pure JS fallback on Safari)
 
 ## License
 
