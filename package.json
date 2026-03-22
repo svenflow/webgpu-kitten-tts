@@ -1,7 +1,7 @@
 {
   "name": "webgpu-kitten-tts",
   "version": "0.1.0",
-  "description": "Run Kitten TTS (80M) locally in the browser via WebGPU. One function call: textToWav('Hello!') → WAV blob.",
+  "description": "Run Kitten TTS (80M) locally in the browser via WebGPU. One function call: textToSpeech('Hello!') → WAV blob.",
   "type": "module",
   "main": "./dist-lib/index.js",
   "module": "./dist-lib/index.js",

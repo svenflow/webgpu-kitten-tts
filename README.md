@@ -23,9 +23,9 @@ npm install webgpu-kitten-tts
 ```
 
 ```typescript
-import { textToWav } from 'webgpu-kitten-tts';
+import { textToSpeech } from 'webgpu-kitten-tts';
 
-const blob = await textToWav("The quick brown fox jumps over the lazy dog.");
+const blob = await textToSpeech("The quick brown fox jumps over the lazy dog.");
 
 // Play it
 const audio = new Audio(URL.createObjectURL(blob));
@@ -39,13 +39,13 @@ One function, one line, WAV audio out. The model is initialized on the first cal
 ### Basic
 
 ```typescript
-const blob = await textToWav("Hello world");
+const blob = await textToSpeech("Hello world");
 ```
 
 ### Custom voice and speed
 
 ```typescript
-const blob = await textToWav("Welcome to the future of browser TTS.", {
+const blob = await textToSpeech("Welcome to the future of browser TTS.", {
   voice: "Leo",
   speed: 1.2,
 });
@@ -54,7 +54,7 @@ const blob = await textToWav("Welcome to the future of browser TTS.", {
 ### Progress callback
 
 ```typescript
-const blob = await textToWav("Generating speech with progress updates.", {
+const blob = await textToSpeech("Generating speech with progress updates.", {
   onProgress: (stage) => console.log(stage),
   // Logs: "Initializing WebGPU…", "Downloading model…", "Phonemizing…",
   //       "Generating speech…", "Encoding WAV…"

@@ -4,10 +4,10 @@
  * One function is all you need:
  *
  * ```typescript
- * import { textToWav } from 'webgpu-kitten-tts';
+ * import { textToSpeech } from 'webgpu-kitten-tts';
  *
- * const wavBlob = await textToWav('Hello, world!');
- * const audio = new Audio(URL.createObjectURL(wavBlob));
+ * const wav = await textToSpeech('Hello, world!');
+ * const audio = new Audio(URL.createObjectURL(wav));
  * audio.play();
  * ```
  */
@@ -36,8 +36,8 @@ import { KittenTTSEngine } from './engine.js';
 import { textToInputIds } from './phonemizer.js';
 import { float32ToWav } from './wav.js';
 
-/** Options for the `textToWav` function. */
-export interface TextToWavOptions {
+/** Options for the `textToSpeech` function. */
+export interface TextToSpeechOptions {
   /** Voice name. Default: `'Bella'`. */
   voice?: string;
   /** Speaking speed multiplier. Default: `1.0`. Range: 0.5 – 2.0. */
@@ -101,26 +101,26 @@ async function getEngine(onProgress?: (stage: string) => void): Promise<KittenTT
  *
  * @example
  * ```typescript
- * import { textToWav } from 'webgpu-kitten-tts';
+ * import { textToSpeech } from 'webgpu-kitten-tts';
  *
  * // Simple usage
- * const wav = await textToWav('Hello, world!');
+ * const wav = await textToSpeech('Hello, world!');
  *
  * // Play it
  * const audio = new Audio(URL.createObjectURL(wav));
  * audio.play();
  *
  * // With options
- * const wav2 = await textToWav('Slow and steady wins the race.', {
+ * const wav2 = await textToSpeech('Slow and steady wins the race.', {
  *   voice: 'Bella',
  *   speed: 0.8,
  *   onProgress: (stage) => console.log(stage),
  * });
  * ```
  */
-export async function textToWav(
+export async function textToSpeech(
   text: string,
-  options?: TextToWavOptions,
+  options?: TextToSpeechOptions,
 ): Promise<Blob> {
   if (!text?.trim()) {
     throw new Error('Text must be a non-empty string.');
