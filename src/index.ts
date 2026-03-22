@@ -17,7 +17,7 @@ import { KittenTTSEngine } from './engine.js';
 import { textToInputIds } from './phonemizer.js';
 import { float32ToWav } from './wav.js';
 
-/** Model size variant. Default: `'mini'`. */
+/** Model size variant. Default: `'nano'`. */
 export type ModelSize = 'mini' | 'micro' | 'nano';
 
 /** Options for the `textToSpeech` function. */
@@ -26,7 +26,7 @@ export interface TextToSpeechOptions {
   voice?: string;
   /** Speaking speed multiplier. Default: `1.0`. Range: 0.5 – 2.0. */
   speed?: number;
-  /** Model size variant. Default: `'mini'` (80M, best quality). `'micro'` (40M) and `'nano'` (15M) are smaller/faster. */
+  /** Model size variant. Default: `'nano'` (15M, fastest, 24 MB). `'micro'` (40M) and `'mini'` (80M, best quality) are larger. */
   model?: ModelSize;
   /** Progress callback, called with stage descriptions like `'Loading model…'`. */
   onProgress?: (stage: string) => void;
@@ -123,7 +123,7 @@ export async function textToSpeech(
     throw new Error('Text must be a non-empty string.');
   }
 
-  const { voice = 'Bella', speed = 1.0, model = 'mini', onProgress } = options ?? {};
+  const { voice = 'Bella', speed = 1.0, model = 'nano', onProgress } = options ?? {};
 
   const e = await getEngine(model, onProgress);
 

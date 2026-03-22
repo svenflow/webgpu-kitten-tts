@@ -51,9 +51,9 @@ Three [Kitten TTS v0.8](https://huggingface.co/KittenML) sizes, same API:
 *RT = real-time factor (audio duration ÷ generation time). Higher is better. Times are for warm generation (model already in GPU). First call adds ~2-4s for model download depending on connection.*
 
 ```typescript
-await textToSpeech("Hello world");                        // Default: mini
-await textToSpeech("Hello world", { model: 'micro' });    // Balanced
-await textToSpeech("Hello world", { model: 'nano' });     // Fastest
+await textToSpeech("Hello world");                        // Default: nano (fastest, 24 MB)
+await textToSpeech("Hello world", { model: 'micro' });    // Balanced (41 MB)
+await textToSpeech("Hello world", { model: 'mini' });     // Best quality (78 MB)
 ```
 
 ## Options

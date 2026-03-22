@@ -57,7 +57,7 @@ if (urlModel && urlModel in MODELS) {
 }
 
 function getSelectedModel() {
-  const key = modelSelect.value || 'mini';
+  const key = modelSelect.value || 'nano';
   return { key, ...MODELS[key] };
 }
 
