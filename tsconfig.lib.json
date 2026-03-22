@@ -5,5 +5,5 @@
     "emitDeclarationOnly": true,
     "outDir": "dist-lib"
   },
-  "include": ["src/index.ts", "src/wav.ts", "src/engine.ts", "src/phonemizer.ts", "src/types.ts", "src/onnx.ts", "src/shaders.ts", "src/espeak-rules.ts"]
+  "include": ["src/index.ts", "src/wav.ts", "src/engine.ts", "src/phonemizer.ts", "src/polyfills.ts", "src/types.ts", "src/onnx.ts", "src/shaders.ts", "src/espeak-rules.ts"]
 }

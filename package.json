@@ -13,23 +13,24 @@
       "default": "./dist-lib/index.js"
     }
   },
-  "sideEffects": [
-    "./dist-lib/index.js"
-  ],
+  "sideEffects": false,
   "files": [
     "dist-lib",
     "LICENSE"
   ],
   "scripts": {
+    "prepare": "patch-package",
     "dev": "vite",
     "build": "vite build",
     "build:lib": "BUILD_LIB=1 vite build && tsc --project tsconfig.lib.json",
     "preview": "vite preview",
     "prepublishOnly": "npm run build:lib",
-    "test": "npx tsx tests/phonemizer.test.ts"
+    "test": "tsx tests/phonemizer.test.ts"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69",
+    "patch-package": "^8.0.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.7.0",
     "vite": "^6.0.0"
   },

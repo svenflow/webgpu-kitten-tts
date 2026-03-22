@@ -13,8 +13,6 @@
  */
 
 import { installStreamPolyfill } from './polyfills.js';
-installStreamPolyfill();
-
 import { KittenTTSEngine } from './engine.js';
 import { textToInputIds } from './phonemizer.js';
 import { float32ToWav } from './wav.js';
@@ -56,9 +54,12 @@ async function getEngine(model: ModelSize = 'mini', onProgress?: (stage: string)
   if (pending) return pending;
 
   const promise = (async () => {
+    // Lazy polyfill — only runs once, avoids top-level side effects for tree-shaking
+    installStreamPolyfill();
+
     if (!navigator.gpu) {
       throw new Error(
-        'WebGPU is not available. Use a browser that supports WebGPU (Chrome 113+, Edge 113+, or Safari 18+).'
+        'WebGPU is not available. Use a browser that supports WebGPU (Chrome 113+, Edge 113+, or Safari 26+).'
       );
     }
 
