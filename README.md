@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/kitten-tts-webgpu)](https://www.npmjs.com/package/kitten-tts-webgpu)
 [![license](https://img.shields.io/npm/l/kitten-tts-webgpu)](./LICENSE)
 
-**Pure WebGPU text-to-speech for the browser. 80M params, sub-second on desktop, ~1.2s on iPhone. No ONNX Runtime, no WASM inference — just 29 compute shaders.**
+**Pure WebGPU text-to-speech for the browser. 80M params, sub-second on desktop, ~1.2s on iPhone. No ONNX Runtime, no WASM inference — just 29 compute shaders. 753KB gzipped JS + model weights downloaded at runtime.**
 
 [**Live Demo**](https://svenflow.github.io/kitten-tts-webgpu/) | [npm](https://www.npmjs.com/package/kitten-tts-webgpu) | [Model Card](https://huggingface.co/KittenML/kitten-tts-mini-0.8)
 
@@ -27,17 +27,28 @@ One function. Text in, WAV blob out (16-bit PCM, 24 kHz mono). The model downloa
 
 > **Note:** This library requires WebGPU. For server-side rendering frameworks (Next.js, Nuxt), dynamically import on the client side only.
 
-## Models
+## Size & Performance
+
+### What gets downloaded
+
+| | Size | When |
+|-|------|------|
+| **JS bundle** | **753 KB** gzipped (2.9 MB raw) | `npm install` / bundled into your app |
+| **Model weights** | 24–78 MB (see below) | First `textToSpeech()` call, cached by browser |
+
+The JS bundle includes the WebGPU engine, 29 compute shaders, and a 234K-word phonemizer dictionary. No WASM binaries, no ONNX Runtime.
+
+### Models
 
 Three [Kitten TTS v0.8](https://huggingface.co/KittenML) sizes, same API:
 
-| Model | Params | Download | M4 Pro (Chrome) | iPhone 17 Pro Max |
-|-------|--------|----------|------------------|-------------------|
-| **Mini** | 80M | 78 MB | 1.80s (3.3x RT) | ~1.2s |
-| **Micro** | 40M | 41 MB | 1.05s (6.2x RT) | untested |
-| **Nano** | 15M | 24 MB | 0.93s (7.3x RT) | untested |
+| Model | Params | Weights | M4 Pro (Chrome) | iPhone 17 Pro Max (Safari) |
+|-------|--------|---------|------------------|----------------------------|
+| **Mini** | 80M | 78 MB | 1.80s (3.3× RT) | ~1.2s |
+| **Micro** | 40M | 41 MB | 1.05s (6.2× RT) | — |
+| **Nano** | 15M | 24 MB | 0.93s (7.3× RT) | — |
 
-*RT = real-time multiplier (audio duration / generation time). Higher is better. Times are warm (model cached in GPU). First call includes ~2-4s model download.*
+*RT = real-time factor (audio duration ÷ generation time). Higher is better. Times are for warm generation (model already in GPU). First call adds ~2-4s for model download depending on connection.*
 
 ```typescript
 await textToSpeech("Hello world");                        // Default: mini
@@ -143,7 +154,7 @@ Most browser TTS uses ONNX Runtime Web (~2MB WASM binary + C++ runtime). This pr
 
 **Self-hosting models?** Pass custom URLs to `KittenTTSEngine.loadModel(onnxUrl, voicesUrl)`.
 
-**Bundle size?** ~750KB gzipped (includes engine, shaders, and 234K-word phonemizer dictionary). Model weights (24-78MB) download separately at runtime.
+**Bundle size?** 753KB gzipped (2.9MB raw). Includes engine, 29 compute shaders, and 234K-word phonemizer dictionary. Model weights (24–78MB depending on model size) are downloaded separately at runtime on first call and cached by the browser.
 
 **Model license?** Kitten TTS models are released under [Apache 2.0](https://huggingface.co/KittenML/kitten-tts-mini-0.8). Code in this repo is MIT.
 
